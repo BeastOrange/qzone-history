@@ -1,6 +1,11 @@
 
 # qzone-history QQ空间历史还原
 
+> 🚀 **新增：一键导出工具（[`oneclick/`](oneclick/)）** —— 下载 [Releases](../../releases) 里的
+> `QzoneExport.exe`（Windows）或 `QzoneExport-macOS`（Mac），**双击 → 扫码 → 自动生成并打开网页**，
+> 电脑上无需安装任何环境。它通过官方说说接口拉取你**现存**的全部说说，下载**原图**并内嵌进单个 HTML，
+> 支持搜索、点击看大图。详见 [oneclick/README.md](oneclick/README.md)。
+
 ### 项目简介
 
 QZone History Restoration 是一个旨在还原和重建 QQ 空间历史的项目。通过收集和分析用户的活动记录，即使某些说说、留言板消息等内容已被删除，本项目也能够进行推理并进行数据重建，帮助用户找回珍贵的历史回忆。
