@@ -4,7 +4,8 @@
 > 🚀 **新增：一键导出工具（[`oneclick/`](oneclick/)）** —— 下载 [Releases](../../releases) 里的
 > `QzoneExport.exe`（Windows）或 `QzoneExport-macOS`（Mac），**双击 → 扫码 → 自动生成并打开网页**，
 > 电脑上无需安装任何环境。它通过官方说说接口拉取你**现存**的全部说说，下载**原图**并内嵌进单个 HTML，
-> 支持搜索、点击看大图。详见 [oneclick/README.md](oneclick/README.md)。
+> 支持搜索、点击看大图。**v1.1 起还会扫描动态流、尝试重建当年被删除的说说**（用 🕯 标记），并生成
+> 详细日志便于排查。详见 [oneclick/README.md](oneclick/README.md)。
 
 ### 项目简介
 

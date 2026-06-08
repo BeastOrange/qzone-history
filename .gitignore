@@ -5,6 +5,14 @@
 app.db
 qrcode.png
 
+# oneclick 产物（作为 release 资产分发，不入库）
+oneclick/QzoneExport
+oneclick/QzoneExport-macOS
+oneclick/login_qr.png
+oneclick/cookies.json
+oneclick/QzoneExport_log_*.txt
+oneclick/QQ空间_*.html
+
 # Binaries for programs and plugins
 *.exe
 *.exe~
