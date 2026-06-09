@@ -926,6 +926,17 @@ func esc(s string) string {
 	return strings.ReplaceAll(s, "\n", "<br>")
 }
 
+func displayImages(m *msg, datauri map[string]string) []string {
+	urls := picURLs(m)
+	imgs := make([]string, 0, len(urls))
+	for _, u := range urls {
+		if src := datauri[u]; src != "" {
+			imgs = append(imgs, src)
+		}
+	}
+	return imgs
+}
+
 // pageCSS 极简卡片流样式。浅色为默认，深色通过 [data-theme=dark] 或（auto 时）
 // prefers-color-scheme 覆盖 CSS 变量实现。
 const pageCSS = `
@@ -1100,18 +1111,14 @@ func renderCard(b *strings.Builder, m *msg, datauri map[string]string) {
 	} else if m.Deleted {
 		b.WriteString(`<div class="content empty">（无文字内容）</div>`)
 	}
-	urls := picURLs(m)
-	if len(urls) > 0 {
-		n := "n" + fmt.Sprint(len(urls))
-		if len(urls) > 4 {
+	imgs := displayImages(m, datauri)
+	if len(imgs) > 0 {
+		n := "n" + fmt.Sprint(len(imgs))
+		if len(imgs) > 4 {
 			n = "n-multi"
 		}
 		b.WriteString(`<div class="imgs ` + n + `">`)
-		for _, u := range urls {
-			src := datauri[u]
-			if src == "" {
-				src = esc(u) // 下载失败时回退原链接（转义，防属性注入）
-			}
+		for _, src := range imgs {
 			b.WriteString(`<img loading="lazy" src="` + src + `" alt="">`)
 		}
 		b.WriteString(`</div>`)

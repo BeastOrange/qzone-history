@@ -159,6 +159,35 @@ func TestUnescapeJS(t *testing.T) {
 	}
 }
 
+func TestRenderCardSkipsUndownloadedImages(t *testing.T) {
+	okURL := "https://example.com/ok.jpg"
+	brokenURL := "https://example.com/broken.jpg"
+	dataURI := "data:image/jpeg;base64,AAAA"
+	m := &msg{
+		Content: "只有一张能显示的图",
+		Pic: []pic{
+			{URL: okURL},
+			{URL: brokenURL},
+		},
+	}
+	var b strings.Builder
+	renderCard(&b, m, map[string]string{okURL: dataURI})
+	got := b.String()
+
+	if strings.Count(got, `<img `) != 1 {
+		t.Fatalf("页面应只渲染 1 张成功下载的图片，实际 HTML: %s", got)
+	}
+	if !strings.Contains(got, `src="`+dataURI+`"`) {
+		t.Errorf("页面应渲染成功内嵌的 data URI: %s", got)
+	}
+	if strings.Contains(got, brokenURL) {
+		t.Errorf("下载失败的远程图片不应回退渲染成 broken img: %s", got)
+	}
+	if !strings.Contains(got, `class="imgs n1"`) {
+		t.Errorf("图片网格应按实际可展示图片数计算为 n1: %s", got)
+	}
+}
+
 func contains(s, sub string) bool {
 	return len(s) >= len(sub) && (indexOf(s, sub) >= 0)
 }
