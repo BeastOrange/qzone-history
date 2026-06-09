@@ -188,8 +188,94 @@ func TestRenderCardSkipsUndownloadedImages(t *testing.T) {
 	}
 }
 
+func TestImageCandidatesKeepFallbackURLs(t *testing.T) {
+	m := &msg{
+		Pic: []pic{{
+			Url3:     "https://example.com/original.jpg?w=100&h=100",
+			URL:      "https://example.com/middle.jpg",
+			Smallurl: "https://example.com/small.jpg",
+		}},
+	}
+
+	items := imageCandidates(m)
+	if len(items) != 1 {
+		t.Fatalf("应生成 1 个图片候选组，实际 %d", len(items))
+	}
+	if items[0].Key != "https://example.com/original.jpg" {
+		t.Fatalf("主键应优先使用原图地址，实际 %q", items[0].Key)
+	}
+	for _, want := range []string{
+		"https://example.com/original.jpg",
+		"https://example.com/original.jpg?w=100&h=100",
+		"https://example.com/middle.jpg",
+		"https://example.com/small.jpg",
+	} {
+		if !hasString(items[0].URLs, want) {
+			t.Errorf("候选 URL 应包含 %q，实际 %#v", want, items[0].URLs)
+		}
+	}
+}
+
+func TestDownloadImageCandidateFallsBack(t *testing.T) {
+	imageBytes := append([]byte{0xff, 0xd8, 0xff, 0xdb}, make([]byte, 256)...)
+	item := imageCandidate{
+		Key: "https://example.com/bad",
+		URLs: []string{
+			"https://example.com/bad",
+			"https://example.com/ok",
+		},
+	}
+	got, used, err := downloadImageCandidateWith(item, func(u string) ([]byte, error) {
+		if strings.HasSuffix(u, "/ok") {
+			return imageBytes, nil
+		}
+		return []byte("<html>not image</html>"), nil
+	})
+	if err != nil {
+		t.Fatalf("备用地址可用时不应失败: %v", err)
+	}
+	if used != "https://example.com/ok" {
+		t.Fatalf("应使用备用地址，实际 %q", used)
+	}
+	if !strings.HasPrefix(got, "data:image/jpeg;base64,") {
+		preview := got
+		if len(preview) > 40 {
+			preview = preview[:40]
+		}
+		t.Fatalf("应返回 jpeg data URI，实际 %q", preview)
+	}
+}
+
+func TestDownloadConcurrency(t *testing.T) {
+	t.Setenv("QZONE_DOWNLOAD_CONCURRENCY", "")
+	if got := downloadConcurrency(); got != defaultDownloadConcurrency {
+		t.Fatalf("默认并发=%d，实际 %d", defaultDownloadConcurrency, got)
+	}
+	t.Setenv("QZONE_DOWNLOAD_CONCURRENCY", "24")
+	if got := downloadConcurrency(); got != 24 {
+		t.Fatalf("环境变量应设置并发 24，实际 %d", got)
+	}
+	t.Setenv("QZONE_DOWNLOAD_CONCURRENCY", "0")
+	if got := downloadConcurrency(); got != defaultDownloadConcurrency {
+		t.Fatalf("非法并发应回退默认值，实际 %d", got)
+	}
+	t.Setenv("QZONE_DOWNLOAD_CONCURRENCY", "100")
+	if got := downloadConcurrency(); got != 64 {
+		t.Fatalf("并发上限应为 64，实际 %d", got)
+	}
+}
+
 func contains(s, sub string) bool {
 	return len(s) >= len(sub) && (indexOf(s, sub) >= 0)
+}
+
+func hasString(items []string, want string) bool {
+	for _, item := range items {
+		if item == want {
+			return true
+		}
+	}
+	return false
 }
 
 // 类名顺序反过来（f-s-s 在 f-single 前面）时，解析器仍应能切出条目。

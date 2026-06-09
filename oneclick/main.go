@@ -30,7 +30,7 @@ import (
 const ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
 
 // version 当前一键导出工具版本（写入日志与网页，便于排查）
-const version = "1.2"
+const version = "1.3"
 
 // ---------- 详细日志 ----------
 //
@@ -165,6 +165,8 @@ type config struct {
 	QQ      string            `json:"qq"`
 	Cookies map[string]string `json:"cookies"`
 	GTK     flexStr           `json:"g_tk"`
+
+	client *http.Client `json:"-"`
 }
 
 type pic struct {
@@ -349,6 +351,7 @@ func login(dir string) *config {
 		qq = uinM[1]
 	}
 	cfg := &config{QQ: qq, Cookies: cookies, GTK: flexStr(genGTK(skey))}
+	cfg.initHTTPClient()
 	lg("login: 成功 QQ=%s cookies=[%s]", qq, cookieNames(cookies))
 	saveConfig(dir, cfg)
 	return cfg
@@ -368,10 +371,18 @@ func loadConfig(dir string) *config {
 	if json.Unmarshal(b, &cfg) != nil || cfg.QQ == "" {
 		return nil
 	}
+	cfg.initHTTPClient()
 	return &cfg
 }
 
 // ---------- 抓取 ----------
+
+func (c *config) initHTTPClient() {
+	if c.client != nil {
+		return
+	}
+	c.client = &http.Client{Timeout: 45 * time.Second}
+}
 
 func (c *config) cookieHeader() string {
 	parts := make([]string, 0, len(c.Cookies))
@@ -382,31 +393,59 @@ func (c *config) cookieHeader() string {
 }
 
 func (c *config) httpGet(u string) ([]byte, error) {
+	return c.httpGetWithRetry(u, 3, time.Second)
+}
+
+func (c *config) httpGetImage(u string) ([]byte, error) {
+	return c.httpGetWithRetry(u, 8, 2*time.Second)
+}
+
+func (c *config) httpGetWithRetry(u string, attempts int, baseDelay time.Duration) ([]byte, error) {
+	if attempts < 1 {
+		attempts = 1
+	}
+	c.initHTTPClient()
 	var lastErr error
-	for attempt := 1; attempt <= 3; attempt++ {
+	for attempt := 1; attempt <= attempts; attempt++ {
 		req, _ := http.NewRequest("GET", u, nil)
 		req.Header.Set("User-Agent", ua)
 		req.Header.Set("Referer", "https://user.qzone.qq.com/"+c.QQ)
 		req.Header.Set("Cookie", c.cookieHeader())
-		client := &http.Client{Timeout: 35 * time.Second}
-		resp, err := client.Do(req)
+		resp, err := c.client.Do(req)
 		if err != nil {
 			lastErr = err
-			lg("httpGet 第%d次失败 url=%s err=%v", attempt, maskURL(u), err)
-			time.Sleep(time.Duration(attempt) * time.Second)
+			lg("httpGet 第%d/%d次失败 url=%s err=%v", attempt, attempts, maskURL(u), err)
+			sleepBeforeRetry(attempt, attempts, baseDelay)
 			continue
 		}
 		body, rerr := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if rerr != nil {
 			lastErr = rerr
-			lg("httpGet 第%d次读取失败 url=%s err=%v", attempt, maskURL(u), rerr)
-			time.Sleep(time.Duration(attempt) * time.Second)
+			lg("httpGet 第%d/%d次读取失败 url=%s err=%v", attempt, attempts, maskURL(u), rerr)
+			sleepBeforeRetry(attempt, attempts, baseDelay)
+			continue
+		}
+		if resp.StatusCode >= 500 || resp.StatusCode == http.StatusTooManyRequests {
+			lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
+			lg("httpGet 第%d/%d次服务端错误 url=%s status=%d", attempt, attempts, maskURL(u), resp.StatusCode)
+			sleepBeforeRetry(attempt, attempts, baseDelay)
 			continue
 		}
 		return body, nil
 	}
 	return nil, lastErr
+}
+
+func sleepBeforeRetry(attempt, attempts int, baseDelay time.Duration) {
+	if attempt >= attempts {
+		return
+	}
+	delay := time.Duration(attempt) * baseDelay
+	if delay > 15*time.Second {
+		delay = 15 * time.Second
+	}
+	time.Sleep(delay)
 }
 
 var jsonpRe = regexp.MustCompile(`(?s)^[^(]*\((.*)\)[^)]*$`)
@@ -434,32 +473,84 @@ func (c *config) fetchPage(pos, num int) (*msglistResp, error) {
 	return &r, nil
 }
 
-var wRe = regexp.MustCompile(`&w=\d+`)
-var hRe = regexp.MustCompile(`&h=\d+`)
+var wRe = regexp.MustCompile(`([?&])w=\d+&?`)
+var hRe = regexp.MustCompile(`([?&])h=\d+&?`)
 var sizeRe = regexp.MustCompile(`!/\w+&`)
 
 func toOriginal(u string) string {
 	u = strings.ReplaceAll(u, "\\", "")
-	u = wRe.ReplaceAllString(u, "")
-	u = hRe.ReplaceAllString(u, "")
+	u = stripQueryNumberParam(u, wRe)
+	u = stripQueryNumberParam(u, hRe)
 	u = sizeRe.ReplaceAllString(u, "!/0&")
 	return u
 }
 
-func picURLs(m *msg) []string {
-	// 重建出来的说说图片走 ExtraImgs（已是直链），现存说说走 pic 结构
-	if m.Deleted {
-		return m.ExtraImgs
+func stripQueryNumberParam(u string, re *regexp.Regexp) string {
+	out := re.ReplaceAllString(u, "$1")
+	out = strings.ReplaceAll(out, "?&", "?")
+	return strings.TrimSuffix(out, "?")
+}
+
+type imageCandidate struct {
+	Key  string
+	URLs []string
+}
+
+func isImageSource(u string) bool {
+	return u != "" && (strings.HasPrefix(u, "http") || strings.HasPrefix(u, "data:"))
+}
+
+func appendUniqueURL(urls []string, u string) []string {
+	if !isImageSource(u) {
+		return urls
 	}
-	var out []string
-	for _, p := range m.Pic {
-		for _, v := range []string{p.Url3, p.Url2, p.Url1, p.URL, p.Smallurl} {
-			// 接受 http/https/data: 开头的 URL
-			if v != "" && (strings.HasPrefix(v, "http") || strings.HasPrefix(v, "data:")) {
-				out = append(out, toOriginal(v))
-				break
+	for _, existing := range urls {
+		if existing == u {
+			return urls
+		}
+	}
+	return append(urls, u)
+}
+
+func picCandidates(p pic) []string {
+	var urls []string
+	for _, v := range []string{p.Url3, p.Url2, p.Url1, p.URL, p.Smallurl} {
+		if !isImageSource(v) {
+			continue
+		}
+		raw := strings.ReplaceAll(v, "\\", "")
+		urls = appendUniqueURL(urls, toOriginal(raw))
+		urls = appendUniqueURL(urls, raw)
+	}
+	return urls
+}
+
+func imageCandidates(m *msg) []imageCandidate {
+	if m.Deleted {
+		out := make([]imageCandidate, 0, len(m.ExtraImgs))
+		for _, u := range m.ExtraImgs {
+			urls := appendUniqueURL(nil, u)
+			if len(urls) > 0 {
+				out = append(out, imageCandidate{Key: urls[0], URLs: urls})
 			}
 		}
+		return out
+	}
+	out := make([]imageCandidate, 0, len(m.Pic))
+	for _, p := range m.Pic {
+		urls := picCandidates(p)
+		if len(urls) > 0 {
+			out = append(out, imageCandidate{Key: urls[0], URLs: urls})
+		}
+	}
+	return out
+}
+
+func picURLs(m *msg) []string {
+	candidates := imageCandidates(m)
+	out := make([]string, 0, len(candidates))
+	for _, item := range candidates {
+		out = append(out, item.Key)
 	}
 	return out
 }
@@ -937,6 +1028,77 @@ func displayImages(m *msg, datauri map[string]string) []string {
 	return imgs
 }
 
+func imageDataURI(raw []byte) (string, bool) {
+	if len(raw) <= 200 {
+		return "", false
+	}
+	mime := http.DetectContentType(raw)
+	if !strings.HasPrefix(mime, "image/") {
+		return "", false
+	}
+	return "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(raw), true
+}
+
+func (c *config) downloadImageCandidate(item imageCandidate) (string, string, error) {
+	return downloadImageCandidateWith(item, c.httpGetImage)
+}
+
+func downloadImageCandidateWith(item imageCandidate, get func(string) ([]byte, error)) (string, string, error) {
+	var lastErr error
+	for i, u := range item.URLs {
+		if strings.HasPrefix(u, "data:image/") {
+			return u, u, nil
+		}
+		raw, err := get(u)
+		if du, ok := imageDataURI(raw); err == nil && ok {
+			if i > 0 {
+				lg("图片候选回退成功 key=%s fallback=%s", maskURL(item.Key), maskURL(u))
+			}
+			return du, u, nil
+		}
+		if err != nil {
+			lastErr = err
+		} else {
+			lastErr = fmt.Errorf("响应不是有效图片或过小 len=%d mime=%s", len(raw), http.DetectContentType(raw))
+		}
+		lg("图片候选失败 key=%s candidate=%s err=%v", maskURL(item.Key), maskURL(u), lastErr)
+	}
+	return "", "", lastErr
+}
+
+const defaultDownloadConcurrency = 16
+
+func downloadConcurrency() int {
+	raw := strings.TrimSpace(os.Getenv("QZONE_DOWNLOAD_CONCURRENCY"))
+	if raw == "" {
+		return defaultDownloadConcurrency
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 1 {
+		return defaultDownloadConcurrency
+	}
+	if n > 64 {
+		return 64
+	}
+	return n
+}
+
+func validateConfig(cfg *config) bool {
+	for attempt := 1; attempt <= 5; attempt++ {
+		r, err := cfg.fetchPage(0, 1)
+		if err == nil && r.Code == 0 {
+			return true
+		}
+		if err == nil {
+			lg("cookies 校验返回非0 code=%d message=%q", r.Code, r.Message)
+			return false
+		}
+		lg("cookies 校验第%d/5次网络失败: %v", attempt, err)
+		sleepBeforeRetry(attempt, 5, 2*time.Second)
+	}
+	return false
+}
+
 // pageCSS 极简卡片流样式。浅色为默认，深色通过 [data-theme=dark] 或（auto 时）
 // prefers-color-scheme 覆盖 CSS 变量实现。
 const pageCSS = `
@@ -1217,10 +1379,10 @@ func main() {
 	cfg := loadConfig(dir)
 	if cfg != nil {
 		lg("检测到本地 cookies.json，校验登录态…")
-		if r, err := cfg.fetchPage(0, 1); err == nil && r.Code == 0 {
+		fmt.Println("检测到本地 cookies.json，正在校验登录态…")
+		if validateConfig(cfg) {
 			say("✅ 检测到有效登录（QQ %s），跳过扫码", cfg.QQ)
 		} else {
-			lg("本地登录失效 err=%v", err)
 			fmt.Println("ℹ️ 旧登录已过期，需要重新扫码")
 			cfg = nil
 		}
@@ -1277,13 +1439,13 @@ func main() {
 
 	// 收集图片（现存 + 重建）
 	seen := map[string]bool{}
-	var urls []string
+	var images []imageCandidate
 	collect := func(list []msg) {
 		for i := range list {
-			for _, u := range picURLs(&list[i]) {
-				if !seen[u] {
-					seen[u] = true
-					urls = append(urls, u)
+			for _, item := range imageCandidates(&list[i]) {
+				if !seen[item.Key] {
+					seen[item.Key] = true
+					images = append(images, item)
 				}
 			}
 		}
@@ -1291,41 +1453,40 @@ func main() {
 	collect(msgs)
 	collect(deleted)
 
-	fmt.Printf("下载 %d 张图片（原图画质）…\n", len(urls))
-	lg("待下载图片 %d 张", len(urls))
+	concurrency := downloadConcurrency()
+	fmt.Printf("下载 %d 张图片（原图画质，并发 %d，失败自动尝试备用地址）…\n", len(images), concurrency)
+	lg("待下载图片 %d 张，并发 %d", len(images), concurrency)
 	datauri := map[string]string{}
 	var mu sync.Mutex
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, 8)
+	sem := make(chan struct{}, concurrency)
 	var done int
 	var dmu sync.Mutex
-	for _, u := range urls {
+	for _, item := range images {
 		wg.Add(1)
 		sem <- struct{}{}
-		go func(u string) {
+		go func(item imageCandidate) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			raw, err := cfg.httpGet(u)
+			du, used, err := cfg.downloadImageCandidate(item)
 			dmu.Lock()
 			done++
-			fmt.Printf("  %d/%d\r", done, len(urls))
+			fmt.Printf("  %d/%d\r", done, len(images))
 			dmu.Unlock()
-			if err == nil && len(raw) > 200 {
-				mime := http.DetectContentType(raw)
-				if !strings.HasPrefix(mime, "image/") {
-					mime = "image/jpeg" // 嗅探失败时回退
-				}
-				du := "data:" + mime + ";base64," + base64.StdEncoding.EncodeToString(raw)
+			if err == nil {
 				mu.Lock()
-				datauri[u] = du
+				datauri[item.Key] = du
 				mu.Unlock()
+				if used != item.Key {
+					lg("图片使用备用地址 key=%s used=%s", maskURL(item.Key), maskURL(used))
+				}
 			} else {
-				lg("图片下载失败/过小 url=%s err=%v len=%d", u, err, len(raw))
+				lg("图片下载失败 key=%s candidates=%d err=%v", maskURL(item.Key), len(item.URLs), err)
 			}
-		}(u)
+		}(item)
 	}
 	wg.Wait()
-	say("\n图片完成：成功 %d/%d", len(datauri), len(urls))
+	say("\n图片完成：成功 %d/%d", len(datauri), len(images))
 
 	sort.Slice(msgs, func(i, j int) bool { return msgs[i].CreatedTime > msgs[j].CreatedTime })
 	sort.Slice(deleted, func(i, j int) bool { return deleted[i].CreatedTime > deleted[j].CreatedTime })
