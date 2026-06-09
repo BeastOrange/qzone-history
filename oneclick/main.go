@@ -30,7 +30,7 @@ import (
 const ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
 
 // version 当前一键导出工具版本（写入日志与网页，便于排查）
-const version = "1.1"
+const version = "1.2"
 
 // ---------- 详细日志 ----------
 //
@@ -454,7 +454,8 @@ func picURLs(m *msg) []string {
 	var out []string
 	for _, p := range m.Pic {
 		for _, v := range []string{p.Url3, p.Url2, p.Url1, p.URL, p.Smallurl} {
-			if strings.HasPrefix(v, "http") {
+			// 接受 http/https/data: 开头的 URL
+			if v != "" && (strings.HasPrefix(v, "http") || strings.HasPrefix(v, "data:")) {
 				out = append(out, toOriginal(v))
 				break
 			}
@@ -465,32 +466,101 @@ func picURLs(m *msg) []string {
 
 // ---------- 动态流抓取 + 解析 + 重建 ----------
 
-// processOldHTML 复刻主程序 utils.ProcessOldHTML：从 JSONP 响应里取出 html:'...' 段，
-// 解码 \xHH，去掉转义反斜杠。
+// processOldHTML 从 JSONP 响应里取出**全部** html:'...' 段，并正确还原 JS 字符串转义。
+//
+// 关键修复 1（条数）：动态流一页响应是 data:[{…html:'…',opuin:…},{…html:'…',opuin:…},…]，
+// 每个 feed 各有一个 html 段。旧实现只取第一个 `html:'...',opuin` 段，导致一页里 86 条
+// 动态只解析出 1 条（其余 85 条连同它们的图片被整段丢弃）。这里改为提取并拼接所有 html 段。
+//
+// 关键修复 2（乱码）：QQ 模板里的缩进是 JS 转义 `\t`、换行是 `\n`（反斜杠+字母，不是真正的
+// 制表符/换行）。旧实现“先折叠空白、再粗暴删掉所有反斜杠”，导致 `\t` 残留成裸字母 t，
+// 输出一堆 `ttttt…`。这里改为：先取 html 段 -> 正确还原 \xHH/\uHHHH/\t/\n/\r/\"/\\/\/
+// -> 最后再折叠空白。
 func processOldHTML(message string) string {
-	re := regexp.MustCompile(`\\x[0-9a-fA-F]{2}`)
-	newText := re.ReplaceAllStringFunc(message, func(h string) string {
-		b, err := strconv.ParseUint(h[2:], 16, 8)
-		if err != nil {
-			return h
-		}
-		return string(rune(b))
-	})
 	const startString = "html:'"
 	const endString = "',opuin"
-	si := strings.Index(newText, startString)
-	if si < 0 {
+	var sb strings.Builder
+	rest := message
+	for {
+		si := strings.Index(rest, startString)
+		if si < 0 {
+			break
+		}
+		si += len(startString)
+		ei := strings.Index(rest[si:], endString)
+		if ei < 0 {
+			break
+		}
+		sb.WriteString(rest[si : si+ei])
+		rest = rest[si+ei+len(endString):]
+	}
+	if sb.Len() == 0 {
 		return ""
 	}
-	si += len(startString)
-	ei := strings.Index(newText[si:], endString)
-	if ei < 0 {
-		return ""
+	seg := unescapeJS(sb.String())
+	seg = regexp.MustCompile(`\s+`).ReplaceAllString(seg, " ")
+	return seg
+}
+
+// unescapeJS 还原 JS 字符串里的转义序列。\xHH / \uHHHH 按字节/码点还原（中文常以 \xHH
+// 字节序列出现，逐字节写出后整体仍是合法 UTF-8）。
+func unescapeJS(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); {
+		c := s[i]
+		if c != '\\' || i+1 >= len(s) {
+			b.WriteByte(c)
+			i++
+			continue
+		}
+		n := s[i+1]
+		switch n {
+		case 'x':
+			if i+3 < len(s) {
+				if v, err := strconv.ParseUint(s[i+2:i+4], 16, 8); err == nil {
+					b.WriteByte(byte(v))
+					i += 4
+					continue
+				}
+			}
+			b.WriteByte(n)
+			i += 2
+		case 'u':
+			if i+5 < len(s) {
+				if v, err := strconv.ParseUint(s[i+2:i+6], 16, 32); err == nil {
+					b.WriteRune(rune(v))
+					i += 6
+					continue
+				}
+			}
+			b.WriteByte(n)
+			i += 2
+		case 't':
+			b.WriteByte('\t')
+			i += 2
+		case 'n':
+			b.WriteByte('\n')
+			i += 2
+		case 'r':
+			b.WriteByte('\r')
+			i += 2
+		case 'b':
+			b.WriteByte('\b')
+			i += 2
+		case 'f':
+			b.WriteByte('\f')
+			i += 2
+		case '0':
+			b.WriteByte(0)
+			i += 2
+		default:
+			// \" \' \\ \/ 以及其它：保留转义后的那个字符本身
+			b.WriteByte(n)
+			i += 2
+		}
 	}
-	newText = newText[si : si+ei]
-	newText = regexp.MustCompile(`\s+`).ReplaceAllString(newText, " ")
-	newText = strings.ReplaceAll(newText, "\\", "")
-	return newText
+	return b.String()
 }
 
 // 动态流字段提取正则。条目切分与字段匹配都做到“类名顺序无关”，避免 QQ 调整 class
@@ -632,30 +702,67 @@ func parseFeedTime(s string) time.Time {
 	return time.Time{}
 }
 
-// fetchAllActivities 翻页抓取整条动态流
+// totalNumRe 从动态流响应里读取 total_number（QQ 告知的互动总条数），用于驱动翻页。
+var totalNumRe = regexp.MustCompile(`total_number:(\d+)`)
+
+// fetchAllActivities 翻页抓取整条动态流。
+//
+// QQ 的 feeds2_html_pav_all 在一页（count=100）里会把多条动态放进 data:[] 数组，
+// processOldHTML 现在会提取其中**全部** html 段。翻页用响应里的 total_number 驱动：
+// offset 从 0 每次步进 count，直到覆盖 total_number。不再用“连续空页就停”——因为
+// 动态流数据可能稀疏，中间的空页会让旧逻辑误判到底而漏掉后面的大量数据。
 func (c *config) fetchAllActivities() []activity {
 	var all []activity
 	const pageSize = 100
 	const maxPages = 200 // 安全上限，避免异常时无限翻页
-	empty := 0
-	for page := 0; page < maxPages; page++ {
-		offset := page * pageSize
+
+	fetch := func(offset int) (string, []byte, error) {
 		u := fmt.Sprintf("https://user.qzone.qq.com/proxy/domain/ic2.qzone.qq.com/cgi-bin/feeds/feeds2_html_pav_all?uin=%s&begin_time=0&end_time=0&getappnotification=1&getnotifi=1&has_get_key=0&offset=%d&set=0&count=%d&useutf8=1&outputhtmlfeed=1&scope=1&format=jsonp&g_tk=%s",
 			c.QQ, offset, pageSize, string(c.GTK))
 		body, err := c.httpGet(u)
 		if err != nil {
-			lg("fetchAllActivities offset=%d 请求失败: %v", offset, err)
-			break
+			return "", nil, err
 		}
-		processed := processOldHTML(string(body))
+		return processOldHTML(string(body)), body, nil
+	}
+
+	// 先抓首页，读出 total_number 作为翻页上限
+	firstHTML, firstBody, err := fetch(0)
+	if err != nil {
+		lg("fetchAllActivities offset=0 请求失败: %v", err)
+		return all
+	}
+	total := 0
+	if m := totalNumRe.FindSubmatch(firstBody); m != nil {
+		total, _ = strconv.Atoi(string(m[1]))
+	}
+	lg("动态流首页 原始响应(截断2000字): %s", truncate(string(firstBody), 2000))
+	lg("动态流首页 处理后HTML(截断2000字): %s", truncate(firstHTML, 2000))
+	lg("动态流 total_number=%d", total)
+
+	empty := 0
+	for page := 0; page < maxPages; page++ {
+		offset := page * pageSize
+		var processed string
 		if page == 0 {
-			lg("动态流首页 原始响应(截断2000字): %s", truncate(string(body), 2000))
-			lg("动态流首页 处理后HTML(截断2000字): %s", truncate(processed, 2000))
+			processed = firstHTML
+		} else {
+			processed, _, err = fetch(offset)
+			if err != nil {
+				lg("fetchAllActivities offset=%d 请求失败: %v", offset, err)
+				break
+			}
 		}
+
 		if processed == "" || !strings.Contains(processed, "f-single") {
 			empty++
 			lg("fetchAllActivities offset=%d 无活动条目(empty=%d)", offset, empty)
-			if empty >= 2 {
+			// 已知总数时，只要还没翻完就继续（容忍中间空页）；未知总数时退回“连续空页”判断
+			if total > 0 {
+				if offset >= total {
+					break
+				}
+			} else if empty >= 3 {
 				break
 			}
 			time.Sleep(200 * time.Millisecond)
@@ -664,11 +771,16 @@ func (c *config) fetchAllActivities() []activity {
 		empty = 0
 		acts := c.parseActivities(processed)
 		lg("fetchAllActivities offset=%d 解析到 %d 条活动", offset, len(acts))
-		if len(acts) == 0 {
-			break
-		}
 		all = append(all, acts...)
 		fmt.Printf("  动态流已扫 %d 条互动\r", len(all))
+
+		// 已抓到的条数已覆盖总数则收工
+		if total > 0 && len(all) >= total {
+			break
+		}
+		if total > 0 && offset >= total {
+			break
+		}
 		time.Sleep(200 * time.Millisecond)
 	}
 	return all
@@ -814,103 +926,219 @@ func esc(s string) string {
 	return strings.ReplaceAll(s, "\n", "<br>")
 }
 
-func buildHTML(qq string, msgs []msg, datauri map[string]string) string {
+// pageCSS 极简卡片流样式。浅色为默认，深色通过 [data-theme=dark] 或（auto 时）
+// prefers-color-scheme 覆盖 CSS 变量实现。
+const pageCSS = `
+:root{
+  --bg:#f6f7f9; --surface:#ffffff; --text:#1c2024; --muted:#8a9099;
+  --line:#e7e9ee; --accent:#e8833a; --like:#e8833a;
+  --recon:#c9792f; --recon-bar:#e8a866; --recon-tint:#fbf6ef;
+  --shadow:0 1px 2px rgba(20,24,30,.04);
+}
+:root[data-theme=dark]{
+  --bg:#0f1115; --surface:#1a1d24; --text:#e6e8eb; --muted:#878e99;
+  --line:#262b34; --accent:#f2a73b; --like:#f2a73b;
+  --recon:#ffb784; --recon-bar:#7a4f2c; --recon-tint:#1f1813;
+  --shadow:none;
+}
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme=light]){
+    --bg:#0f1115; --surface:#1a1d24; --text:#e6e8eb; --muted:#878e99;
+    --line:#262b34; --accent:#f2a73b; --like:#f2a73b;
+    --recon:#ffb784; --recon-bar:#7a4f2c; --recon-tint:#1f1813;
+    --shadow:none;
+  }
+}
+*{box-sizing:border-box;}
+body{margin:0;background:var(--bg);color:var(--text);line-height:1.62;
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+  -webkit-font-smoothing:antialiased;transition:background .2s,color .2s;}
+.topbar{position:sticky;top:0;z-index:20;padding:14px 20px 12px;
+  background:color-mix(in srgb,var(--bg) 85%,transparent);backdrop-filter:saturate(180%) blur(12px);
+  border-bottom:1px solid var(--line);}
+.bar-inner{max-width:640px;margin:0 auto;display:flex;align-items:center;justify-content:space-between;gap:12px;}
+.titles h1{margin:0;font-size:17px;font-weight:650;letter-spacing:.2px;}
+.titles .sub{margin:2px 0 0;font-size:12.5px;color:var(--muted);}
+.theme-btn{width:38px;height:38px;flex:none;border:1px solid var(--line);border-radius:10px;
+  background:var(--surface);color:var(--text);font-size:17px;cursor:pointer;line-height:1;
+  display:flex;align-items:center;justify-content:center;transition:border-color .15s,transform .1s;}
+.theme-btn:hover{border-color:var(--accent);} .theme-btn:active{transform:scale(.94);}
+.search{display:block;max-width:640px;margin:12px auto 0;width:100%;padding:9px 14px;font-size:14px;
+  border:1px solid var(--line);border-radius:11px;background:var(--surface);color:var(--text);outline:none;}
+.search:focus{border-color:var(--accent);}
+.wrap{max-width:640px;margin:0 auto;padding:22px 20px 60px;}
+.zone{margin:0;} .zone+.zone{margin-top:10px;}
+.zone-head{margin:26px 0 14px;padding-top:22px;border-top:1px dashed var(--line);}
+.zone-head h2{margin:0;font-size:15px;font-weight:650;color:var(--recon);}
+.zone-note{margin:6px 0 0;font-size:12.5px;color:var(--muted);}
+.card{background:var(--surface);border:1px solid var(--line);border-radius:16px;
+  padding:16px 18px;margin-bottom:14px;box-shadow:var(--shadow);}
+.card.deleted{border-left:3px solid var(--recon-bar);background:var(--recon-tint);}
+.card-head{display:flex;align-items:center;gap:8px;margin-bottom:8px;}
+.date{color:var(--muted);font-size:12.5px;}
+.badge{font-size:11.5px;color:var(--recon);border:1px solid var(--recon-bar);border-radius:6px;padding:1px 7px;}
+.content{white-space:pre-wrap;word-break:break-word;font-size:15px;}
+.content.empty{color:var(--muted);font-style:italic;}
+.imgs{display:grid;gap:6px;margin-top:12px;}
+.imgs.n1{grid-template-columns:minmax(0,72%);} .imgs.n2,.imgs.n4{grid-template-columns:repeat(2,1fr);}
+.imgs.n3,.imgs.n-multi{grid-template-columns:repeat(3,1fr);}
+.imgs img{width:100%;aspect-ratio:1;object-fit:cover;border-radius:10px;background:var(--line);cursor:zoom-in;}
+.imgs.n1 img{aspect-ratio:auto;max-height:420px;width:auto;max-width:100%;object-fit:contain;}
+.meta{display:flex;gap:16px;margin-top:12px;color:var(--muted);font-size:13px;}
+.m-like{color:var(--like);}
+.cmts{margin-top:12px;padding-top:10px;border-top:1px solid var(--line);font-size:13px;}
+.cmt{color:var(--muted);margin:3px 0;} .cmt b{color:var(--text);font-weight:600;}
+.cmt-faded{opacity:.7;}
+.noresult{text-align:center;color:var(--muted);padding:40px 0;}
+.hidden{display:none!important;}
+#lb{display:none;position:fixed;inset:0;background:rgba(0,0,0,.92);z-index:9999;
+  align-items:center;justify-content:center;cursor:zoom-out;padding:3vw;}
+#lb img{max-width:96vw;max-height:96vh;object-fit:contain;border-radius:8px;}
+`
+
+// pageJS 主题三态切换（auto→light→dark→auto，记忆到 localStorage）+ 搜索过滤 + 图片灯箱
+const pageJS = `
+(function(){
+  var root=document.documentElement,btn=document.getElementById('theme');
+  var icons={auto:'🌓',light:'☀️',dark:'🌙'},order=['auto','light','dark'];
+  function cur(){return root.getAttribute('data-theme')||'auto';}
+  function render(){btn.textContent=icons[cur()]||'🌓';}
+  render();
+  btn.addEventListener('click',function(){
+    var i=order.indexOf(cur()),next=order[(i+1)%order.length];
+    root.setAttribute('data-theme',next);
+    try{localStorage.setItem('qz-theme',next);}catch(e){}
+    render();
+  });
+  var q=document.getElementById('q'),no=document.getElementById('noresult');
+  var cards=[].slice.call(document.querySelectorAll('.card'));
+  var zones=[].slice.call(document.querySelectorAll('.zone'));
+  q.addEventListener('input',function(){
+    var v=q.value.trim().toLowerCase(),hits=0;
+    cards.forEach(function(c){
+      var ok=!v||c.textContent.toLowerCase().indexOf(v)>=0;
+      c.classList.toggle('hidden',!ok); if(ok)hits++;
+    });
+    zones.forEach(function(z){
+      z.classList.toggle('hidden',!z.querySelector('.card:not(.hidden)'));
+    });
+    no.classList.toggle('hidden',hits>0);
+  });
+  document.addEventListener('click',function(e){
+    if(e.target.tagName==='IMG'&&e.target.closest('.imgs')){
+      document.getElementById('lbimg').src=e.target.src;
+      document.getElementById('lb').style.display='flex';
+    }
+  });
+  document.addEventListener('keydown',function(e){
+    if(e.key==='Escape')document.getElementById('lb').style.display='none';
+  });
+})();
+`
+
+// buildHTML 生成自包含网页：现存说说 + 重建（疑似已删除）说说分两区展示，极简卡片流，
+// 支持 深/浅/自动 主题切换、搜索、点击看大图。
+func buildHTML(qq string, existing, deleted []msg, datauri map[string]string) string {
 	eqq := esc(qq)
 	var b strings.Builder
-	b.WriteString(`<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>QQ空间 · ` + eqq + `</title><style>
-:root{--bg:#0f1115;--card:#1a1d24;--text:#e6e8eb;--muted:#8b929e;--accent:#f2a73b;}
-*{box-sizing:border-box;}
-body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,"Segoe UI","Microsoft YaHei","PingFang SC",sans-serif;line-height:1.6;}
-.topbar{position:sticky;top:0;background:rgba(15,17,21,.94);backdrop-filter:blur(8px);padding:14px 20px;border-bottom:1px solid #2a2e37;z-index:10;}
-.topbar h1{margin:0;font-size:17px;}
-.topbar input{margin-top:10px;width:100%;padding:8px 12px;border-radius:8px;border:1px solid #2a2e37;background:#13161c;color:var(--text);font-size:14px;}
-.wrap{max-width:680px;margin:0 auto;padding:20px;}
-.card{background:var(--card);border:1px solid #252934;border-radius:14px;padding:16px 18px;margin-bottom:16px;}
-.card header{margin-bottom:8px;} .date{color:var(--muted);font-size:13px;}
-.content{white-space:pre-wrap;word-break:break-word;}
-.imgs{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-top:12px;}
-.imgs img{width:100%;aspect-ratio:1;object-fit:cover;border-radius:8px;background:#0a0c10;cursor:zoom-in;}
-.cmts{margin-top:12px;padding-top:10px;border-top:1px solid #252934;font-size:13px;}
-.cmt{color:var(--muted);margin:3px 0;} .cmt b{color:#bcd0ff;}
-footer{display:flex;gap:16px;margin-top:12px;color:var(--muted);font-size:13px;} .like{color:var(--accent);}
-.hidden{display:none;}
-.card.deleted{border-color:#5a3a2a;background:#221a17;}
-.badge{display:inline-block;font-size:12px;color:#ffb784;background:#3a2a1f;border:1px solid #5a3a2a;border-radius:6px;padding:1px 7px;margin-left:8px;vertical-align:middle;}
-.recon-note{color:var(--muted);font-size:12px;margin-top:6px;font-style:italic;}
-#lb{display:none;position:fixed;inset:0;background:rgba(0,0,0,.93);z-index:9999;align-items:center;justify-content:center;cursor:zoom-out;}
-#lb img{max-width:96vw;max-height:96vh;object-fit:contain;border-radius:6px;}
-</style></head><body>`)
-	delCount := 0
-	for i := range msgs {
-		if msgs[i].Deleted {
-			delCount++
-		}
+	// 头部：内联一段“尽早应用主题”的脚本，避免浅/深切换时的闪烁
+	b.WriteString(`<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>QQ空间 · ` + eqq + `</title>`)
+	b.WriteString(`<script>(function(){try{var t=localStorage.getItem('qz-theme')||'auto';document.documentElement.setAttribute('data-theme',t);}catch(e){}})();</script>`)
+	b.WriteString(`<style>` + pageCSS + `</style></head><body>`)
+	// 顶栏：标题 + 计数 + 搜索 + 主题切换按钮
+	b.WriteString(`<header class="topbar"><div class="bar-inner">`)
+	b.WriteString(`<div class="titles"><h1>QQ空间 · ` + eqq + `</h1>`)
+	sub := fmt.Sprint(len(existing)) + ` 条现存说说`
+	if len(deleted) > 0 {
+		sub += ` · ` + fmt.Sprint(len(deleted)) + ` 条重建`
 	}
-	title := `共 ` + fmt.Sprint(len(msgs)) + ` 条`
-	if delCount > 0 {
-		title += `（含 ` + fmt.Sprint(delCount) + ` 条🕯重建·疑似已删除）`
+	b.WriteString(`<p class="sub">` + sub + `</p></div>`)
+	b.WriteString(`<button id="theme" class="theme-btn" title="切换 深色 / 浅色 / 跟随系统" aria-label="切换主题"></button>`)
+	b.WriteString(`</div><input id="q" class="search" placeholder="搜索说说内容…"></header>`)
+
+	b.WriteString(`<main class="wrap">`)
+
+	// 现存说说区
+	b.WriteString(`<section class="zone"><div class="feed">`)
+	for i := range existing {
+		renderCard(&b, &existing[i], datauri)
 	}
-	b.WriteString(`<div class="topbar"><h1>QQ空间 · ` + eqq + ` · ` + title + `</h1><input id="q" placeholder="搜索内容…"></div>`)
-	b.WriteString(`<div class="wrap" id="feed">`)
-	for i := range msgs {
-		m := &msgs[i]
-		cls := "card"
-		if m.Deleted {
-			cls = "card deleted"
+	b.WriteString(`</div></section>`)
+
+	// 重建（疑似已删除）区
+	if len(deleted) > 0 {
+		b.WriteString(`<section class="zone recon-zone"><div class="zone-head">`)
+		b.WriteString(`<h2>🕯 互动痕迹还原 · 疑似已删除</h2>`)
+		b.WriteString(`<p class="zone-note">以下 ` + fmt.Sprint(len(deleted)) + ` 条由你“动态”里的点赞/评论/浏览痕迹反推而来，可能不完整，也可能混入你对他人说说的互动，请自行甄别。</p>`)
+		b.WriteString(`</div><div class="feed">`)
+		for i := range deleted {
+			renderCard(&b, &deleted[i], datauri)
 		}
-		b.WriteString(`<article class="` + cls + `"><header><span class="date">` + fmtTime(m.CreatedTime) + `</span>`)
-		if m.Deleted {
-			b.WriteString(`<span class="badge">🕯 重建 · 疑似已删除</span>`)
-		}
-		b.WriteString(`</header>`)
-		b.WriteString(`<div class="content">` + esc(m.Content) + `</div>`)
-		if m.Deleted {
-			b.WriteString(`<div class="recon-note">此条由互动痕迹还原，内容可能不完整</div>`)
-		}
-		urls := picURLs(m)
-		if len(urls) > 0 {
-			b.WriteString(`<div class="imgs">`)
-			for _, u := range urls {
-				src := datauri[u]
-				if src == "" {
-					src = esc(u) // 下载失败时回退到原链接（转义，避免属性注入）
-				}
-				b.WriteString(`<img loading="lazy" src="` + src + `">`)
-			}
-			b.WriteString(`</div>`)
-		}
-		b.WriteString(`<footer><span class="like">❤ ` + fmt.Sprint(m.LikeTotal) + `</span>`)
-		if len(m.Commentlist) > 0 {
-			b.WriteString(`<span>💬 ` + fmt.Sprint(len(m.Commentlist)) + `</span>`)
-		}
-		if m.Deleted && m.Views > 0 {
-			b.WriteString(`<span>👁 ` + fmt.Sprint(m.Views) + `</span>`)
-		}
-		b.WriteString(`</footer>`)
-		if len(m.Commentlist) > 0 {
-			b.WriteString(`<div class="cmts">`)
-			for _, c := range m.Commentlist {
-				if c.Content == "" {
-					// 重建评论：只有评论者昵称，没有评论原文
-					b.WriteString(`<div class="cmt"><b>` + esc(c.Name) + `</b> 评论过（原文无法找回）</div>`)
-				} else {
-					b.WriteString(`<div class="cmt"><b>` + esc(c.Name) + `</b>：` + esc(c.Content) + `</div>`)
-				}
-			}
-			b.WriteString(`</div>`)
-		}
-		b.WriteString(`</article>`)
+		b.WriteString(`</div></section>`)
 	}
-	b.WriteString(`</div><div id="lb" onclick="this.style.display='none'"><img id="lbimg" src=""></div>`)
-	b.WriteString(`<script>
-var q=document.getElementById('q'),cards=[].slice.call(document.querySelectorAll('.card'));
-q.addEventListener('input',function(){var v=q.value.trim().toLowerCase();
-cards.forEach(function(c){c.classList.toggle('hidden',v&&c.textContent.toLowerCase().indexOf(v)<0);});});
-document.addEventListener('click',function(e){if(e.target.tagName==='IMG'&&e.target.closest('.imgs')){
-document.getElementById('lbimg').src=e.target.src;document.getElementById('lb').style.display='flex';}});
-document.addEventListener('keydown',function(e){if(e.key==='Escape')document.getElementById('lb').style.display='none';});
-</script></body></html>`)
+
+	b.WriteString(`<p id="noresult" class="noresult hidden">没有匹配的说说</p>`)
+	b.WriteString(`</main>`)
+	b.WriteString(`<div id="lb" onclick="this.style.display='none'"><img id="lbimg" src="" alt=""></div>`)
+	b.WriteString(`<script>` + pageJS + `</script></body></html>`)
 	return b.String()
+}
+
+// renderCard 渲染一张说说卡片（现存或重建）
+func renderCard(b *strings.Builder, m *msg, datauri map[string]string) {
+	cls := "card"
+	if m.Deleted {
+		cls = "card deleted"
+	}
+	b.WriteString(`<article class="` + cls + `"><div class="card-head"><span class="date">` + fmtTime(m.CreatedTime) + `</span>`)
+	if m.Deleted {
+		b.WriteString(`<span class="badge">🕯 疑似已删除</span>`)
+	}
+	b.WriteString(`</div>`)
+	if c := esc(m.Content); c != "" {
+		b.WriteString(`<div class="content">` + c + `</div>`)
+	} else if m.Deleted {
+		b.WriteString(`<div class="content empty">（无文字内容）</div>`)
+	}
+	urls := picURLs(m)
+	if len(urls) > 0 {
+		n := "n" + fmt.Sprint(len(urls))
+		if len(urls) > 4 {
+			n = "n-multi"
+		}
+		b.WriteString(`<div class="imgs ` + n + `">`)
+		for _, u := range urls {
+			src := datauri[u]
+			if src == "" {
+				src = esc(u) // 下载失败时回退原链接（转义，防属性注入）
+			}
+			b.WriteString(`<img loading="lazy" src="` + src + `" alt="">`)
+		}
+		b.WriteString(`</div>`)
+	}
+	b.WriteString(`<div class="meta">`)
+	if m.LikeTotal > 0 {
+		b.WriteString(`<span class="m-like">♥ ` + fmt.Sprint(m.LikeTotal) + `</span>`)
+	}
+	if len(m.Commentlist) > 0 {
+		b.WriteString(`<span>💬 ` + fmt.Sprint(len(m.Commentlist)) + `</span>`)
+	}
+	if m.Deleted && m.Views > 0 {
+		b.WriteString(`<span>👁 ` + fmt.Sprint(m.Views) + `</span>`)
+	}
+	b.WriteString(`</div>`)
+	if len(m.Commentlist) > 0 {
+		b.WriteString(`<div class="cmts">`)
+		for _, c := range m.Commentlist {
+			if c.Content == "" {
+				b.WriteString(`<div class="cmt"><b>` + esc(c.Name) + `</b> <span class="cmt-faded">评论过（原文无法找回）</span></div>`)
+			} else {
+				b.WriteString(`<div class="cmt"><b>` + esc(c.Name) + `</b>：` + esc(c.Content) + `</div>`)
+			}
+		}
+		b.WriteString(`</div>`)
+	}
+	b.WriteString(`</article>`)
 }
 
 func waitExit() {
@@ -920,7 +1148,55 @@ func waitExit() {
 	}
 }
 
+// runDemo 用假数据生成一份演示网页（仅供预览 UI / 主题切换，不联网、不登录）。
+// 用法：QzoneExport --demo  -> 生成 QQ空间_demo.html 并打开。
+func runDemo() {
+	t := func(y int, mo time.Month, d, h, mi int) int64 {
+		return time.Date(y, mo, d, h, mi, 0, 0, time.Local).Unix()
+	}
+	// 1x1 透明/彩色像素 data URI，免联网即可看图片网格效果
+	px := func(hex string) string {
+		return "data:image/svg+xml;base64," + base64.StdEncoding.EncodeToString(
+			[]byte(`<svg xmlns="http://www.w3.org/2000/svg" width="120" height="120"><rect width="120" height="120" fill="#`+hex+`"/></svg>`))
+	}
+	existing := []msg{
+		{Content: "终场哨响的那一刻，我脑海里闪过了太多画面。这一年我们一起熬过的夜、跑过的操场，都值了。", CreatedTime: t(2022, 10, 5, 14, 30), LikeTotal: 24,
+			Commentlist: []comment{{Name: "小吴", Content: "包是你的"}, {Name: "懒大王", Content: "加油"}},
+			Pic:         []pic{{URL: px("e8833a")}, {URL: px("4a90d9")}, {URL: px("6fae6f")}}},
+		{Content: "qq也更新一下，新头像求赞 😎", CreatedTime: t(2022, 9, 12, 9, 5), LikeTotal: 12},
+		{Content: "回顾经典", CreatedTime: t(2022, 6, 1, 20, 0), LikeTotal: 7, Pic: []pic{{URL: px("d96b6b")}}},
+	}
+	deleted := []msg{
+		{Content: "好久不见", CreatedTime: t(2021, 12, 5, 18, 0), LikeTotal: 5, Views: 33, Deleted: true,
+			Commentlist: []comment{{Name: "小莉"}, {Name: "男子汉"}}},
+		{Content: "", CreatedTime: t(2021, 8, 20, 11, 0), LikeTotal: 2, Views: 10, Deleted: true,
+			ExtraImgs: []string{px("9b8cd9")}},
+		{Content: "青春才几年，你仨占七年", CreatedTime: 0, LikeTotal: 9, Deleted: true,
+			Commentlist: []comment{{Name: "fantastic"}}},
+	}
+	// datauri：现存走 Pic.URL（经 toOriginal 后即原串），重建走 ExtraImgs，均已是 data URI
+	datauri := map[string]string{}
+	all := append(append([]msg{}, existing...), deleted...)
+	for i := range all {
+		for _, u := range picURLs(&all[i]) {
+			datauri[u] = u
+		}
+	}
+	doc := buildHTML("演示账号", existing, deleted, datauri)
+	out := filepath.Join(exeDir(), "QQ空间_demo.html")
+	if err := os.WriteFile(out, []byte(doc), 0600); err != nil {
+		fmt.Println("写入失败:", err)
+		return
+	}
+	fmt.Println("已生成演示网页:", out)
+	openInSystem(out)
+}
+
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "--demo" {
+		runDemo()
+		return
+	}
 	fmt.Println("================================================")
 	fmt.Printf("        QQ空间说说导出工具  v%s\n", version)
 	fmt.Println("================================================")
@@ -991,19 +1267,22 @@ func main() {
 	lg("聚合成 %d 条候选说说", len(recons))
 	deleted := reconAsDeletedMsgs(recons, msgs)
 	say("重建出 %d 条疑似已删除的说说（已排除现存）", len(deleted))
-	msgs = append(msgs, deleted...)
 
-	// 收集图片
+	// 收集图片（现存 + 重建）
 	seen := map[string]bool{}
 	var urls []string
-	for i := range msgs {
-		for _, u := range picURLs(&msgs[i]) {
-			if !seen[u] {
-				seen[u] = true
-				urls = append(urls, u)
+	collect := func(list []msg) {
+		for i := range list {
+			for _, u := range picURLs(&list[i]) {
+				if !seen[u] {
+					seen[u] = true
+					urls = append(urls, u)
+				}
 			}
 		}
 	}
+	collect(msgs)
+	collect(deleted)
 
 	fmt.Printf("下载 %d 张图片（原图画质）…\n", len(urls))
 	lg("待下载图片 %d 张", len(urls))
@@ -1042,7 +1321,8 @@ func main() {
 	say("\n图片完成：成功 %d/%d", len(datauri), len(urls))
 
 	sort.Slice(msgs, func(i, j int) bool { return msgs[i].CreatedTime > msgs[j].CreatedTime })
-	doc := buildHTML(cfg.QQ, msgs, datauri)
+	sort.Slice(deleted, func(i, j int) bool { return deleted[i].CreatedTime > deleted[j].CreatedTime })
+	doc := buildHTML(cfg.QQ, msgs, deleted, datauri)
 	outPath := filepath.Join(dir, "QQ空间_"+cfg.QQ+".html")
 	if err := os.WriteFile(outPath, []byte(doc), 0600); err != nil {
 		say("❌ 写入网页失败: %v", err)
@@ -1051,7 +1331,7 @@ func main() {
 	}
 	fi, _ := os.Stat(outPath)
 	say("\n✅ 完成！已生成 %s（%.1f MB）", outPath, float64(fi.Size())/1024/1024)
-	say("   现存说说 %d 条 + 重建疑似已删除 %d 条 = 共 %d 条", existingCount, len(deleted), len(msgs))
+	say("   现存说说 %d 条 + 重建疑似已删除 %d 条 = 共 %d 条", existingCount, len(deleted), existingCount+len(deleted))
 	fmt.Println("   正在用默认浏览器打开…")
 	openInSystem(outPath)
 	if len(deleted) == 0 {

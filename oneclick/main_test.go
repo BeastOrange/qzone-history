@@ -1,6 +1,9 @@
 package main
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // 一段贴近真实动态流的合成 HTML：两条互动（一条评论、一条点赞），同一条说说。
 // 用来验证零依赖正则解析器能正确切分条目并提取字段。
@@ -88,6 +91,71 @@ func TestProcessOldHTML(t *testing.T) {
 	}
 	if !contains(got, "hi hello") { // \x68\x69 -> hi
 		t.Errorf("十六进制应被解码为 hi: %q", got)
+	}
+}
+
+// 回归测试：JS 转义 \t \n 必须被正确还原为空白并折叠，绝不能残留成裸字母 t/n。
+// 这是 v1.1 里“重建说说全是 ttttttt 乱码”的根因。
+func TestProcessOldHTMLNoTabGarbage(t *testing.T) {
+	// 模板缩进在 JSONP 里是 \t（反斜杠+t），正文是中文
+	raw := `cb({html:'\t\t\t<li class="f-single f-s-s">\t\t<p class="txt-box-title ellipsis-one">\t\t\t终场哨响</p>\t\t</li>',opuin:'1'})`
+	got := processOldHTML(raw)
+	if contains(got, "ttt") {
+		t.Errorf("不应残留裸字母 t（\\t 必须还原成制表符并折叠）: %q", got)
+	}
+	if contains(got, "nnn") {
+		t.Errorf("不应残留裸字母 n: %q", got)
+	}
+	if !contains(got, "终场哨响") {
+		t.Errorf("中文正文应保留: %q", got)
+	}
+	// 用解析器进一步确认正文干净
+	c := &config{QQ: "1"}
+	acts := c.parseActivities(got)
+	if len(acts) != 1 || acts[0].Content != "终场哨响" {
+		t.Fatalf("解析正文应为「终场哨响」，实际 %#v", acts)
+	}
+}
+
+// 回归测试：一页动态流响应里 data:[] 数组含多个 feed，每个各带一个 html 段。
+// 旧实现只取第一个 `html:'...',opuin` 段，导致一页 N 条只解析出 1 条（其余连同图片被丢弃，
+// 这正是“重建只出 1 条、以前的图全没了”的根因）。新实现应提取并拼接全部 html 段。
+func TestProcessOldHTMLMultiSegment(t *testing.T) {
+	raw := `_Callback({"code":0,"data":{main:{total_number:3},data:[` +
+		`{uin:'111',html:'\x3Cli class=\x22f-single f-s-s\x22>\x3Cp class=\x22txt-box-title ellipsis-one\x22>第一条\x3C\/p>\x3C\/li>',opuin:'1'},` +
+		`{uin:'222',html:'\x3Cli class=\x22f-single f-s-s\x22>\x3Cp class=\x22txt-box-title ellipsis-one\x22>第二条\x3C\/p>\x3C\/li>',opuin:'2'},` +
+		`{uin:'333',html:'\x3Cli class=\x22f-single f-s-s\x22>\x3Cp class=\x22txt-box-title ellipsis-one\x22>第三条\x3C\/p>\x3C\/li>',opuin:'3'}` +
+		`]}})`
+	got := processOldHTML(raw)
+	for _, want := range []string{"第一条", "第二条", "第三条"} {
+		if !contains(got, want) {
+			t.Errorf("应包含 %q，实际: %q", want, got)
+		}
+	}
+	if n := strings.Count(got, "f-single f-s-s"); n != 3 {
+		t.Errorf("应提取出 3 个 li 条目，实际 %d", n)
+	}
+	c := &config{QQ: "999"}
+	acts := c.parseActivities(got)
+	if len(acts) != 3 {
+		t.Fatalf("应解析出 3 条活动，实际 %d", len(acts))
+	}
+}
+
+func TestUnescapeJS(t *testing.T) {
+	cases := map[string]string{
+		`a\tb`:     "a\tb",
+		`a\nb`:     "a\nb",
+		`a\\tb`:    "a\\tb", // \\ -> \, 然后字面 t
+		`\x41\x42`: "AB",
+		`中文`:       "中文",
+		`it\'s`:    "it's",
+		`a\/b`:     "a/b",
+	}
+	for in, want := range cases {
+		if got := unescapeJS(in); got != want {
+			t.Errorf("unescapeJS(%q)=%q, 期望 %q", in, got, want)
+		}
 	}
 }
 
