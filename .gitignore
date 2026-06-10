@@ -13,6 +13,17 @@ oneclick/cookies.json
 oneclick/QzoneExport_log_*.txt
 oneclick/QQ空间_*.html
 
+# 研究产物：动态流缓存 + probe/分析日志（含空间内容，不入库）
+oneclick/feed_cache/
+oneclick/recover_cache/
+oneclick/probe_*.jsonl
+oneclick/cache_activities_*.jsonl
+oneclick/reconstructed_*_preview.html
+oneclick/reconstructed_all_from_cache.html
+oneclick/相册回忆_*.html
+oneclick/留言板_*.html
+oneclick/日志_*.html
+
 # Binaries for programs and plugins
 *.exe
 *.exe~

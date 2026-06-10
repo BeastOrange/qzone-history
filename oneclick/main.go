@@ -5,12 +5,15 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/md5"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"html"
+	"image"
+	"image/png"
 	"io"
 	"net/http"
 	"net/http/cookiejar"
@@ -30,7 +33,7 @@ import (
 const ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
 
 // version 当前一键导出工具版本（写入日志与网页，便于排查）
-const version = "1.3"
+const version = "1.6"
 
 // ---------- 详细日志 ----------
 //
@@ -142,6 +145,74 @@ func openInSystem(path string) {
 	_ = cmd.Start()
 }
 
+func qrPixelDark(img image.Image, x, y int) bool {
+	bounds := img.Bounds()
+	if x < bounds.Min.X || x >= bounds.Max.X || y < bounds.Min.Y || y >= bounds.Max.Y {
+		return false
+	}
+	r, g, b, a := img.At(x, y).RGBA()
+	if a < 0x8000 {
+		return false
+	}
+	luma := (r*299 + g*587 + b*114) / 1000
+	return luma < 0x8000
+}
+
+func qrTerminalScale(width int) int {
+	const targetColumns = 72
+	if width <= targetColumns {
+		return 1
+	}
+	scale := (width + targetColumns - 1) / targetColumns
+	if scale < 1 {
+		return 1
+	}
+	return scale
+}
+
+func qrBlockDark(img image.Image, x, y, scale int) bool {
+	total, dark := 0, 0
+	for yy := y; yy < y+scale; yy++ {
+		for xx := x; xx < x+scale; xx++ {
+			total++
+			if qrPixelDark(img, xx, yy) {
+				dark++
+			}
+		}
+	}
+	return dark*2 >= total
+}
+
+func printQRInTerminal(w io.Writer, pngBytes []byte) error {
+	img, err := png.Decode(bytes.NewReader(pngBytes))
+	if err != nil {
+		return err
+	}
+	bounds := img.Bounds()
+	const quietZone = 2
+	scale := qrTerminalScale(bounds.Dx())
+	padding := quietZone * scale
+	for y := bounds.Min.Y - padding; y < bounds.Max.Y+padding; y += 2 * scale {
+		for x := bounds.Min.X - padding; x < bounds.Max.X+padding; x += scale {
+			topDark := qrBlockDark(img, x, y, scale)
+			bottomDark := qrBlockDark(img, x, y+scale, scale)
+			switch {
+			case topDark && bottomDark:
+				_, _ = io.WriteString(w, "\x1b[30;40m▀")
+			case topDark:
+				_, _ = io.WriteString(w, "\x1b[30;47m▀")
+			case bottomDark:
+				_, _ = io.WriteString(w, "\x1b[37;40m▀")
+			default:
+				_, _ = io.WriteString(w, "\x1b[37;47m▀")
+			}
+		}
+		_, _ = io.WriteString(w, "\x1b[0m\n")
+	}
+	_, _ = io.WriteString(w, "\x1b[0m")
+	return nil
+}
+
 func exeDir() string {
 	exe, err := os.Executable()
 	if err != nil {
@@ -237,6 +308,55 @@ type activity struct {
 	Type       activityType
 }
 
+type probeWindow struct {
+	Label string
+	Begin int64
+	End   int64
+}
+
+type probeRecord struct {
+	Type             string `json:"type"`
+	Strategy         string `json:"strategy"`
+	Window           string `json:"window,omitempty"`
+	WindowBegin      int64  `json:"window_begin,omitempty"`
+	WindowEnd        int64  `json:"window_end,omitempty"`
+	Offset           int    `json:"offset"`
+	Count            int    `json:"count"`
+	Status           string `json:"status"`
+	Error            string `json:"error,omitempty"`
+	LatencyMS        int64  `json:"latency_ms"`
+	BodySize         int    `json:"body_size"`
+	ProcessedSize    int    `json:"processed_size"`
+	HasTotalNumber   bool   `json:"has_total_number"`
+	TotalNumber      int    `json:"total_number,omitempty"`
+	HasHTMLSegment   bool   `json:"has_html_segment"`
+	HasFSingle       bool   `json:"has_f_single"`
+	ParsedCount      int    `json:"parsed_count"`
+	MinTimeText      string `json:"min_time_text,omitempty"`
+	MaxTimeText      string `json:"max_time_text,omitempty"`
+	MinTimestampUnix int64  `json:"min_timestamp_unix,omitempty"`
+	MaxTimestampUnix int64  `json:"max_timestamp_unix,omitempty"`
+}
+
+type activityRecord struct {
+	Type             string   `json:"type"`
+	Strategy         string   `json:"strategy"`
+	Window           string   `json:"window,omitempty"`
+	WindowBegin      int64    `json:"window_begin,omitempty"`
+	WindowEnd        int64    `json:"window_end,omitempty"`
+	Offset           int      `json:"offset"`
+	Index            int      `json:"index"`
+	SenderQQ         string   `json:"sender_qq,omitempty"`
+	SenderName       string   `json:"sender_name,omitempty"`
+	ReceiverQQ       string   `json:"receiver_qq,omitempty"`
+	Content          string   `json:"content,omitempty"`
+	TimeText         string   `json:"time_text,omitempty"`
+	TimestampUnix    int64    `json:"timestamp_unix,omitempty"`
+	ImageURLs        []string `json:"image_urls,omitempty"`
+	ActivityType     string   `json:"activity_type"`
+	ActivityTypeCode int      `json:"activity_type_code"`
+}
+
 // reconMoment 由若干 activity 聚合而成的（疑似已删除的）说说
 type reconMoment struct {
 	Key       string
@@ -287,10 +407,13 @@ func login(dir string) *config {
 		waitExit()
 		os.Exit(1)
 	}
-	qrPath := filepath.Join(dir, "login_qr.png")
-	_ = os.WriteFile(qrPath, png, 0600)
-	fmt.Println("✅ 二维码已弹出，请用【手机QQ】扫码并在手机上点击确认登录…")
-	openInSystem(qrPath)
+	fmt.Println("✅ 二维码已生成，请用【手机QQ】扫描下方二维码并在手机上点击确认登录…")
+	if err := printQRInTerminal(os.Stdout, png); err != nil {
+		say("❌ 终端二维码显示失败：%v", err)
+		waitExit()
+		os.Exit(1)
+	}
+	lg("login: 已在终端展示二维码")
 
 	token := ptqrToken(qrsig)
 	var success string
@@ -473,6 +596,11 @@ func (c *config) fetchPage(pos, num int) (*msglistResp, error) {
 	return &r, nil
 }
 
+func (c *config) feedURL(begin, end int64, offset, count int) string {
+	return fmt.Sprintf("https://user.qzone.qq.com/proxy/domain/ic2.qzone.qq.com/cgi-bin/feeds/feeds2_html_pav_all?uin=%s&begin_time=%d&end_time=%d&getappnotification=1&getnotifi=1&has_get_key=0&offset=%d&set=0&count=%d&useutf8=1&outputhtmlfeed=1&scope=1&format=jsonp&g_tk=%s",
+		c.QQ, begin, end, offset, count, string(c.GTK))
+}
+
 var wRe = regexp.MustCompile(`([?&])w=\d+&?`)
 var hRe = regexp.MustCompile(`([?&])h=\d+&?`)
 var sizeRe = regexp.MustCompile(`!/\w+&`)
@@ -526,7 +654,8 @@ func picCandidates(p pic) []string {
 }
 
 func imageCandidates(m *msg) []imageCandidate {
-	if m.Deleted {
+	// ExtraImgs 是图片直链（重建说说、相册照片都走这里）；只要有就优先用，与 Deleted 无关
+	if len(m.ExtraImgs) > 0 {
 		out := make([]imageCandidate, 0, len(m.ExtraImgs))
 		for _, u := range m.ExtraImgs {
 			urls := appendUniqueURL(nil, u)
@@ -808,9 +937,7 @@ func (c *config) fetchAllActivities() []activity {
 	const maxPages = 200 // 安全上限，避免异常时无限翻页
 
 	fetch := func(offset int) (string, []byte, error) {
-		u := fmt.Sprintf("https://user.qzone.qq.com/proxy/domain/ic2.qzone.qq.com/cgi-bin/feeds/feeds2_html_pav_all?uin=%s&begin_time=0&end_time=0&getappnotification=1&getnotifi=1&has_get_key=0&offset=%d&set=0&count=%d&useutf8=1&outputhtmlfeed=1&scope=1&format=jsonp&g_tk=%s",
-			c.QQ, offset, pageSize, string(c.GTK))
-		body, err := c.httpGet(u)
+		body, err := c.httpGet(c.feedURL(0, 0, offset, pageSize))
 		if err != nil {
 			return "", nil, err
 		}
@@ -997,6 +1124,1246 @@ func tsToUnix(t time.Time) int64 {
 		return 0
 	}
 	return t.Unix()
+}
+
+func activityTypeName(t activityType) string {
+	switch t {
+	case typeMoment:
+		return "moment"
+	case typeForward:
+		return "forward"
+	case typeLike:
+		return "like"
+	case typeComment:
+		return "comment"
+	case typeBoardMsg:
+		return "board_message"
+	case typeReply:
+		return "reply"
+	case typeView:
+		return "view"
+	default:
+		return "other"
+	}
+}
+
+func activityTypeFromRecord(rec activityRecord) activityType {
+	switch rec.ActivityType {
+	case "moment":
+		return typeMoment
+	case "forward":
+		return typeForward
+	case "like":
+		return typeLike
+	case "comment":
+		return typeComment
+	case "board_message":
+		return typeBoardMsg
+	case "reply":
+		return typeReply
+	case "view":
+		return typeView
+	case "other":
+		return typeOther
+	}
+	if rec.ActivityTypeCode >= int(typeMoment) && rec.ActivityTypeCode <= int(typeOther) {
+		return activityType(rec.ActivityTypeCode)
+	}
+	return typeOther
+}
+
+// ---------- 深度探查实验 ----------
+
+const probePageSize = 100
+
+func hasArg(args []string, want string) bool {
+	for _, arg := range args {
+		if arg == want {
+			return true
+		}
+	}
+	return false
+}
+
+func monthWindow(year int, month time.Month) probeWindow {
+	begin := time.Date(year, month, 1, 0, 0, 0, 0, time.Local)
+	end := begin.AddDate(0, 1, 0)
+	return probeWindow{
+		Label: fmt.Sprintf("%04d-%02d", year, int(month)),
+		Begin: begin.Unix(),
+		End:   end.Unix(),
+	}
+}
+
+func defaultProbeWindows() []probeWindow {
+	return []probeWindow{
+		monthWindow(2017, time.September),
+		monthWindow(2017, time.August),
+		monthWindow(2016, time.January),
+		monthWindow(2015, time.January),
+		monthWindow(2015, time.June),
+		monthWindow(2015, time.December),
+	}
+}
+
+func exponentialOffsets(maxOffset int) []int {
+	if maxOffset < 0 {
+		maxOffset = 0
+	}
+	offsets := []int{0, 100}
+	for next := 200; next < maxOffset; next *= 2 {
+		offsets = append(offsets, next)
+	}
+	if offsets[len(offsets)-1] != maxOffset {
+		offsets = append(offsets, maxOffset)
+	}
+	out := offsets[:0]
+	seen := map[int]bool{}
+	for _, offset := range offsets {
+		if offset <= maxOffset && !seen[offset] {
+			seen[offset] = true
+			out = append(out, offset)
+		}
+	}
+	return out
+}
+
+func totalNumber(raw []byte) (int, bool) {
+	m := totalNumRe.FindSubmatch(raw)
+	if m == nil {
+		return 0, false
+	}
+	total, err := strconv.Atoi(string(m[1]))
+	if err != nil {
+		return 0, false
+	}
+	return total, true
+}
+
+func activityTimeRange(acts []activity) (string, string, int64, int64) {
+	if len(acts) == 0 {
+		return "", "", 0, 0
+	}
+	minIdx, maxIdx := -1, -1
+	var minTime, maxTime time.Time
+	for i, act := range acts {
+		if act.Timestamp.IsZero() {
+			continue
+		}
+		if minIdx < 0 || act.Timestamp.Before(minTime) {
+			minIdx = i
+			minTime = act.Timestamp
+		}
+		if maxIdx < 0 || act.Timestamp.After(maxTime) {
+			maxIdx = i
+			maxTime = act.Timestamp
+		}
+	}
+	if minIdx < 0 {
+		return "", "", 0, 0
+	}
+	return acts[minIdx].TimeText, acts[maxIdx].TimeText, minTime.Unix(), maxTime.Unix()
+}
+
+type probeResult struct {
+	Record     probeRecord
+	Activities []activity
+	RawBody    []byte
+}
+
+// analyzeFeedBody 把一段原始动态流响应解析成 probeRecord（不发网络请求）。
+// harvest 缓存命中和 --analyze-cache 离线分析都复用它，保证口径与在线探测完全一致。
+func analyzeFeedBody(c *config, window probeWindow, offset int, strategy string, body []byte) probeRecord {
+	rawText := string(body)
+	processed := processOldHTML(rawText)
+	acts := c.parseActivities(processed)
+	total, ok := totalNumber(body)
+	minText, maxText, minUnix, maxUnix := activityTimeRange(acts)
+	return probeRecord{
+		Type:             "request",
+		Strategy:         strategy,
+		Window:           window.Label,
+		WindowBegin:      window.Begin,
+		WindowEnd:        window.End,
+		Offset:           offset,
+		Count:            harvestPageSize,
+		Status:           "ok",
+		BodySize:         len(body),
+		ProcessedSize:    len(processed),
+		HasTotalNumber:   ok,
+		TotalNumber:      total,
+		HasHTMLSegment:   strings.Contains(rawText, "html:'"),
+		HasFSingle:       strings.Contains(processed, "f-single"),
+		ParsedCount:      len(acts),
+		MinTimeText:      minText,
+		MaxTimeText:      maxText,
+		MinTimestampUnix: minUnix,
+		MaxTimestampUnix: maxUnix,
+	}
+}
+
+func (c *config) probeFeed(window probeWindow, offset, count int, strategy string) probeRecord {
+	return c.probeFeedWithRetry(window, offset, count, strategy, 3, time.Second)
+}
+
+func (c *config) probeFeedWithRetry(window probeWindow, offset, count int, strategy string, attempts int, baseDelay time.Duration) probeRecord {
+	return c.probeFeedResultWithRetry(window, offset, count, strategy, attempts, baseDelay).Record
+}
+
+func (c *config) probeFeedResultWithRetry(window probeWindow, offset, count int, strategy string, attempts int, baseDelay time.Duration) probeResult {
+	start := time.Now()
+	u := c.feedURL(window.Begin, window.End, offset, count)
+	body, err := c.httpGetWithRetry(u, attempts, baseDelay)
+	latency := time.Since(start).Milliseconds()
+	if err != nil {
+		rec := probeRecord{
+			Type:        "request",
+			Strategy:    strategy,
+			Window:      window.Label,
+			WindowBegin: window.Begin,
+			WindowEnd:   window.End,
+			Offset:      offset,
+			Count:       count,
+			LatencyMS:   latency,
+			Status:      "error",
+			Error:       err.Error(),
+		}
+		return probeResult{Record: rec}
+	}
+	rec := analyzeFeedBody(c, window, offset, strategy, body)
+	rec.Count = count
+	rec.LatencyMS = latency
+	return probeResult{Record: rec, Activities: c.parseActivities(processOldHTML(string(body))), RawBody: body}
+}
+
+func writeProbeRecord(w io.Writer, rec probeRecord) error {
+	b, err := json.Marshal(rec)
+	if err != nil {
+		return err
+	}
+	_, err = w.Write(append(b, '\n'))
+	return err
+}
+
+func makeActivityRecord(window probeWindow, offset int, strategy string, index int, act activity) activityRecord {
+	return activityRecord{
+		Type:             "activity",
+		Strategy:         strategy,
+		Window:           window.Label,
+		WindowBegin:      window.Begin,
+		WindowEnd:        window.End,
+		Offset:           offset,
+		Index:            index,
+		SenderQQ:         act.SenderQQ,
+		SenderName:       act.SenderName,
+		ReceiverQQ:       act.ReceiverQQ,
+		Content:          act.Content,
+		TimeText:         act.TimeText,
+		TimestampUnix:    tsToUnix(act.Timestamp),
+		ImageURLs:        append([]string(nil), act.ImageURLs...),
+		ActivityType:     activityTypeName(act.Type),
+		ActivityTypeCode: int(act.Type),
+	}
+}
+
+func writeActivityRecord(w io.Writer, rec activityRecord) error {
+	b, err := json.Marshal(rec)
+	if err != nil {
+		return err
+	}
+	_, err = w.Write(append(b, '\n'))
+	return err
+}
+
+func writeActivityRecords(w io.Writer, window probeWindow, offset int, strategy string, acts []activity) error {
+	for i, act := range acts {
+		if err := writeActivityRecord(w, makeActivityRecord(window, offset, strategy, i, act)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+type probeAnalysis struct {
+	Path                  string
+	RequestCount          int
+	ErrorCount            int
+	ActivityRecordCount   int
+	ParsedActivityCount   int
+	EarliestTimeText      string
+	EarliestTimestampUnix int64
+	EarliestWindow        string
+	FoundBefore20170903   bool
+	Found2015             bool
+	ErrorCounts           map[string]int
+}
+
+var probeLogTimeRe = regexp.MustCompile(`probe_(?:depth|offset_range|offset_list)_(\d{8}_\d{6})\.jsonl$`)
+
+func probeLogTimeKey(path string) string {
+	m := probeLogTimeRe.FindStringSubmatch(filepath.Base(path))
+	if len(m) < 2 {
+		return ""
+	}
+	return m[1]
+}
+
+func latestProbePath(dir string) (string, error) {
+	patterns := []string{"probe_depth_*.jsonl", "probe_offset_range_*.jsonl", "probe_offset_list_*.jsonl"}
+	var matches []string
+	for _, pattern := range patterns {
+		items, err := filepath.Glob(filepath.Join(dir, pattern))
+		if err != nil {
+			return "", err
+		}
+		matches = append(matches, items...)
+	}
+	if len(matches) == 0 {
+		return "", fmt.Errorf("未找到 probe_depth_*.jsonl、probe_offset_range_*.jsonl 或 probe_offset_list_*.jsonl")
+	}
+	sort.Slice(matches, func(i, j int) bool {
+		ki, kj := probeLogTimeKey(matches[i]), probeLogTimeKey(matches[j])
+		if ki != kj {
+			return ki < kj
+		}
+		return matches[i] < matches[j]
+	})
+	return matches[len(matches)-1], nil
+}
+
+func probePathFromArgs(args []string, dir string) (string, error) {
+	for i, arg := range args {
+		if arg != "--analyze-probe" {
+			continue
+		}
+		if i+1 < len(args) && !strings.HasPrefix(args[i+1], "--") {
+			return args[i+1], nil
+		}
+		return latestProbePath(dir)
+	}
+	return "", fmt.Errorf("缺少 --analyze-probe")
+}
+
+func analyzeProbeFile(path string) (probeAnalysis, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return probeAnalysis{}, err
+	}
+	defer f.Close()
+
+	out := probeAnalysis{Path: path, ErrorCounts: map[string]int{}}
+	cutoff := time.Date(2017, time.September, 3, 0, 0, 0, 0, time.Local).Unix()
+	start2015 := time.Date(2015, time.January, 1, 0, 0, 0, 0, time.Local).Unix()
+	end2016 := time.Date(2016, time.January, 1, 0, 0, 0, 0, time.Local).Unix()
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	observeTime := func(ts int64, text, window string) {
+		if ts == 0 {
+			return
+		}
+		if out.EarliestTimestampUnix == 0 || ts < out.EarliestTimestampUnix {
+			out.EarliestTimestampUnix = ts
+			out.EarliestTimeText = text
+			out.EarliestWindow = window
+		}
+		if ts < cutoff {
+			out.FoundBefore20170903 = true
+		}
+		if ts >= start2015 && ts < end2016 {
+			out.Found2015 = true
+		}
+	}
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var kind struct {
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal([]byte(line), &kind); err != nil {
+			return out, fmt.Errorf("解析 JSONL 失败: %w", err)
+		}
+		if kind.Type == "activity" {
+			var rec activityRecord
+			if err := json.Unmarshal([]byte(line), &rec); err != nil {
+				return out, fmt.Errorf("解析 activity JSONL 失败: %w", err)
+			}
+			out.ActivityRecordCount++
+			observeTime(rec.TimestampUnix, rec.TimeText, rec.Window)
+			continue
+		}
+		if kind.Type != "" && kind.Type != "request" {
+			continue
+		}
+		var rec probeRecord
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			return out, fmt.Errorf("解析 request JSONL 失败: %w", err)
+		}
+		out.RequestCount++
+		if rec.Status == "error" {
+			out.ErrorCount++
+			out.ErrorCounts[rec.Error]++
+		}
+		out.ParsedActivityCount += rec.ParsedCount
+		if rec.ParsedCount <= 0 || rec.MinTimestampUnix == 0 {
+			continue
+		}
+		observeTime(rec.MinTimestampUnix, rec.MinTimeText, rec.Window)
+	}
+	if err := scanner.Err(); err != nil {
+		return out, err
+	}
+	return out, nil
+}
+
+func runAnalyzeProbe(args []string, dir string) error {
+	path, err := probePathFromArgs(args, dir)
+	if err != nil {
+		return err
+	}
+	result, err := analyzeProbeFile(path)
+	if err != nil {
+		return err
+	}
+	say("探查日志: %s", result.Path)
+	say("请求数=%d 错误数=%d 解析活动数=%d", result.RequestCount, result.ErrorCount, result.ParsedActivityCount)
+	if result.ActivityRecordCount > 0 {
+		say("活动明细记录=%d（可用于 --preview-year）", result.ActivityRecordCount)
+	}
+	if len(result.ErrorCounts) > 0 {
+		parts := make([]string, 0, len(result.ErrorCounts))
+		for k, v := range result.ErrorCounts {
+			parts = append(parts, fmt.Sprintf("%s=%d", k, v))
+		}
+		sort.Strings(parts)
+		say("错误类型: %s", strings.Join(parts, ", "))
+	}
+	if result.EarliestTimestampUnix > 0 {
+		say("最早活动: %s（窗口 %s，Unix=%d）", result.EarliestTimeText, result.EarliestWindow, result.EarliestTimestampUnix)
+	} else {
+		say("最早活动: 未解析到带时间的活动")
+	}
+	say("是否突破 2017-09-03: %v", result.FoundBefore20170903)
+	say("是否发现 2015 年活动: %v", result.Found2015)
+	return nil
+}
+
+func previewYearFromArgs(args []string) (int, error) {
+	for i, arg := range args {
+		if arg != "--preview-year" {
+			continue
+		}
+		if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
+			return 0, fmt.Errorf("缺少 --preview-year 后的年份")
+		}
+		year, err := strconv.Atoi(args[i+1])
+		if err != nil || year < 2005 || year > time.Now().Year()+1 {
+			return 0, fmt.Errorf("年份参数无效: %q", args[i+1])
+		}
+		return year, nil
+	}
+	return 0, fmt.Errorf("缺少 --preview-year")
+}
+
+func previewProbePathFromArgs(args []string, dir string) (string, error) {
+	for i, arg := range args {
+		if arg != "--preview-year" {
+			continue
+		}
+		if i+2 < len(args) && !strings.HasPrefix(args[i+2], "--") {
+			return args[i+2], nil
+		}
+		return latestProbePath(dir)
+	}
+	return "", fmt.Errorf("缺少 --preview-year")
+}
+
+func activityFromRecord(rec activityRecord) activity {
+	var ts time.Time
+	if rec.TimestampUnix > 0 {
+		ts = time.Unix(rec.TimestampUnix, 0)
+	}
+	return activity{
+		SenderQQ:   rec.SenderQQ,
+		SenderName: rec.SenderName,
+		ReceiverQQ: rec.ReceiverQQ,
+		Content:    rec.Content,
+		Timestamp:  ts,
+		TimeText:   rec.TimeText,
+		ImageURLs:  append([]string(nil), rec.ImageURLs...),
+		Type:       activityTypeFromRecord(rec),
+	}
+}
+
+func readActivityRecords(path string) ([]activityRecord, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var out []activityRecord
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var kind struct {
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal([]byte(line), &kind); err != nil {
+			return nil, fmt.Errorf("解析 JSONL 失败: %w", err)
+		}
+		if kind.Type != "activity" {
+			continue
+		}
+		var rec activityRecord
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			return nil, fmt.Errorf("解析 activity JSONL 失败: %w", err)
+		}
+		out = append(out, rec)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func activityDedupeKey(a activity) string {
+	return strings.Join([]string{
+		a.SenderQQ,
+		a.SenderName,
+		a.ReceiverQQ,
+		a.Content,
+		a.TimeText,
+		strconv.FormatInt(tsToUnix(a.Timestamp), 10),
+		strconv.Itoa(int(a.Type)),
+		strings.Join(a.ImageURLs, "|"),
+	}, "\x00")
+}
+
+func activitiesForYear(records []activityRecord, year int) []activity {
+	seen := map[string]bool{}
+	var out []activity
+	for _, rec := range records {
+		if rec.TimestampUnix == 0 || time.Unix(rec.TimestampUnix, 0).In(time.Local).Year() != year {
+			continue
+		}
+		act := activityFromRecord(rec)
+		key := activityDedupeKey(act)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, act)
+	}
+	return out
+}
+
+func remoteImageMap(msgs []msg) map[string]string {
+	out := map[string]string{}
+	for i := range msgs {
+		for _, u := range picURLs(&msgs[i]) {
+			if u != "" {
+				out[u] = u
+			}
+		}
+	}
+	return out
+}
+
+type previewBuildResult struct {
+	ProbePath       string
+	OutputPath      string
+	ActivityRecords int
+	YearActivities  int
+	Reconstructed   int
+}
+
+func buildPreviewYearFromProbeFile(path string, year int, dir string) (previewBuildResult, error) {
+	records, err := readActivityRecords(path)
+	if err != nil {
+		return previewBuildResult{}, err
+	}
+	if len(records) == 0 {
+		return previewBuildResult{}, fmt.Errorf("探查日志没有 activity 明细；请用 --capture-activities 重新探查")
+	}
+	acts := activitiesForYear(records, year)
+	recons := reconstructMoments(acts)
+	deleted := reconAsDeletedMsgs(recons, nil)
+	sort.Slice(deleted, func(i, j int) bool { return deleted[i].CreatedTime > deleted[j].CreatedTime })
+
+	doc := buildHTML(fmt.Sprintf("%d 年探查预览", year), nil, deleted, remoteImageMap(deleted))
+	out := filepath.Join(dir, fmt.Sprintf("reconstructed_%d_preview.html", year))
+	if err := os.WriteFile(out, []byte(doc), 0600); err != nil {
+		return previewBuildResult{}, err
+	}
+	return previewBuildResult{
+		ProbePath:       path,
+		OutputPath:      out,
+		ActivityRecords: len(records),
+		YearActivities:  len(acts),
+		Reconstructed:   len(deleted),
+	}, nil
+}
+
+func runPreviewYear(args []string, dir string) error {
+	year, err := previewYearFromArgs(args)
+	if err != nil {
+		return err
+	}
+	path, err := previewProbePathFromArgs(args, dir)
+	if err != nil {
+		return err
+	}
+	result, err := buildPreviewYearFromProbeFile(path, year, dir)
+	if err != nil {
+		return err
+	}
+	say("探查日志: %s", result.ProbePath)
+	say("activity 明细=%d，%d 年活动=%d，重建预览=%d 条", result.ActivityRecords, year, result.YearActivities, result.Reconstructed)
+	say("已生成预览 HTML: %s", result.OutputPath)
+	say("提示：预览页不下载图片，只引用探查日志里的图片 URL。")
+	return nil
+}
+
+func intArg(args []string, name string, fallback int) int {
+	for i, arg := range args {
+		if arg == name && i+1 < len(args) {
+			value, err := strconv.Atoi(args[i+1])
+			if err == nil {
+				return value
+			}
+		}
+	}
+	return fallback
+}
+
+func strArg(args []string, name, fallback string) string {
+	for i, arg := range args {
+		if arg == name && i+1 < len(args) {
+			return args[i+1]
+		}
+	}
+	return fallback
+}
+
+func offsetRange(args []string) (int, int, int) {
+	start := intArg(args, "--offset-start", 3300)
+	end := intArg(args, "--offset-end", 6300)
+	step := intArg(args, "--offset-step", 100)
+	if start < 0 {
+		start = 0
+	}
+	if end < start {
+		end = start
+	}
+	if step <= 0 {
+		step = 100
+	}
+	return start, end, step
+}
+
+func probeDelay(args []string, fallback time.Duration) time.Duration {
+	ms := intArg(args, "--probe-delay-ms", int(fallback/time.Millisecond))
+	if ms < 200 {
+		ms = 200
+	}
+	if ms > 30000 {
+		ms = 30000
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
+func probeCooldownSchedule() []time.Duration {
+	return []time.Duration{5 * time.Minute, 10 * time.Minute, 20 * time.Minute, 30 * time.Minute}
+}
+
+type probeCooldown struct {
+	enabled  bool
+	schedule []time.Duration
+	next     int
+	sleep    func(time.Duration)
+}
+
+func newProbeCooldown(args []string) *probeCooldown {
+	return newProbeCooldownWithSleep(args, time.Sleep)
+}
+
+func newProbeCooldownWithSleep(args []string, sleep func(time.Duration)) *probeCooldown {
+	if sleep == nil {
+		sleep = time.Sleep
+	}
+	return &probeCooldown{
+		enabled:  !hasArg(args, "--no-auto-cooldown"),
+		schedule: probeCooldownSchedule(),
+		sleep:    sleep,
+	}
+}
+
+func isProbeCooldownError(rec probeRecord) bool {
+	if rec.Status != "error" {
+		return false
+	}
+	return strings.Contains(rec.Error, "HTTP 501") || strings.Contains(rec.Error, "HTTP 429")
+}
+
+func (p *probeCooldown) reset() {
+	if p != nil {
+		p.next = 0
+	}
+}
+
+func (p *probeCooldown) waitIfNeeded(strategy string, offset int, rec probeRecord) bool {
+	if p == nil || !p.enabled || !isProbeCooldownError(rec) {
+		return false
+	}
+	if p.next >= len(p.schedule) {
+		say("%s offset=%d 持续返回 %s，自动冷却次数已用尽", strategy, offset, rec.Error)
+		return false
+	}
+	delay := p.schedule[p.next]
+	p.next++
+	say("%s offset=%d 返回 %s，自动冷却 %s 后重试（%d/%d）",
+		strategy, offset, rec.Error, delay, p.next, len(p.schedule))
+	p.sleep(delay)
+	return true
+}
+
+func (c *config) probeFeedResultWithCooldown(window probeWindow, offset, count int, strategy string, attempts int, baseDelay time.Duration, cooldown *probeCooldown) probeResult {
+	for {
+		result := c.probeFeedResultWithRetry(window, offset, count, strategy, attempts, baseDelay)
+		if cooldown != nil && cooldown.waitIfNeeded(strategy, offset, result.Record) {
+			continue
+		}
+		if !isProbeCooldownError(result.Record) {
+			cooldown.reset()
+		}
+		return result
+	}
+}
+
+// probeRawWithCooldown 与 probeFeedResultWithCooldown 行为一致，但单次请求（attempts=1），
+// 用于 harvest：靠 cooldown 处理 501/429 长冷却，避免每页内部多次快速重试加剧风控。
+func (c *config) probeRawWithCooldown(window probeWindow, offset, count int, strategy string, cooldown *probeCooldown) probeResult {
+	return c.probeFeedResultWithCooldown(window, offset, count, strategy, 1, time.Second, cooldown)
+}
+
+func intListArg(args []string, name string, fallback []int) []int {
+	var raw string
+	for i, arg := range args {
+		if arg == name && i+1 < len(args) {
+			raw = args[i+1]
+			break
+		}
+	}
+	if raw == "" {
+		return append([]int(nil), fallback...)
+	}
+	var out []int
+	seen := map[int]bool{}
+	for _, part := range strings.Split(raw, ",") {
+		value, err := strconv.Atoi(strings.TrimSpace(part))
+		if err != nil || value < 0 || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	if len(out) == 0 {
+		return append([]int(nil), fallback...)
+	}
+	return out
+}
+
+func defaultOffsetList() []int {
+	return []int{
+		0, 100, 200, 400, 800, 1600,
+		3000, 3100, 3150, 3190, 3200, 3210, 3250, 3300, 3400,
+		3600, 4000, 4400, 4800, 5200, 5600, 6000, 6400, 6800, 7200,
+		8000, 9600, 12800,
+	}
+}
+
+func runProbeOffsetRange(cfg *config, dir string, args []string) error {
+	start, end, step := offsetRange(args)
+	delay := probeDelay(args, 900*time.Millisecond)
+	cooldown := newProbeCooldown(args)
+	captureActivities := hasArg(args, "--capture-activities")
+	maxConsecutiveErrors := intArg(args, "--max-consecutive-errors", 5)
+	if maxConsecutiveErrors < 1 {
+		maxConsecutiveErrors = 5
+	}
+	out := filepath.Join(dir, "probe_offset_range_"+time.Now().Format("20060102_150405")+".jsonl")
+	f, err := os.OpenFile(out, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	if err != nil {
+		return fmt.Errorf("创建 offset 探查日志失败: %w", err)
+	}
+	defer f.Close()
+
+	say("开始 offset 密集探查，范围 %d..%d step=%d delay=%s，结果写入 %s", start, end, step, delay, out)
+	base := probeWindow{Label: "all-time", Begin: 0, End: 0}
+	healthResult := cfg.probeFeedResultWithCooldown(base, 0, probePageSize, "health-check", 1, time.Second, cooldown)
+	health := healthResult.Record
+	if err := writeProbeRecord(f, health); err != nil {
+		return fmt.Errorf("写入健康检查记录失败: %w", err)
+	}
+	if captureActivities {
+		if err := writeActivityRecords(f, base, 0, "health-check", healthResult.Activities); err != nil {
+			return fmt.Errorf("写入健康检查活动记录失败: %w", err)
+		}
+	}
+	if health.Status == "error" {
+		say("健康检查失败 offset=0 error=%s；停止探查，建议稍后冷却后重试", health.Error)
+		return nil
+	}
+	say("健康检查通过 offset=0 parsed=%d total=%d", health.ParsedCount, health.TotalNumber)
+	consecutiveErrors := 0
+	for offset := start; offset <= end; offset += step {
+		result := cfg.probeFeedResultWithCooldown(base, offset, probePageSize, "offset-range", 1, time.Second, cooldown)
+		rec := result.Record
+		if err := writeProbeRecord(f, rec); err != nil {
+			return fmt.Errorf("写入 offset 探查记录失败: %w", err)
+		}
+		if captureActivities {
+			if err := writeActivityRecords(f, base, offset, "offset-range", result.Activities); err != nil {
+				return fmt.Errorf("写入 offset 活动记录失败: %w", err)
+			}
+		}
+		say("offset=%d parsed=%d total=%d min=%s max=%s status=%s",
+			offset, rec.ParsedCount, rec.TotalNumber, rec.MinTimeText, rec.MaxTimeText, rec.Status)
+		if rec.Status == "error" {
+			lg("offset 密集探查 offset=%d 失败: %s", offset, rec.Error)
+			consecutiveErrors++
+		} else {
+			consecutiveErrors = 0
+		}
+		if consecutiveErrors >= maxConsecutiveErrors {
+			say("连续 %d 个 offset 失败，提前停止以避免无效请求", consecutiveErrors)
+			break
+		}
+		time.Sleep(delay)
+	}
+	say("offset 密集探查完成：%s", out)
+	return nil
+}
+
+func runProbeOffsetList(cfg *config, dir string, args []string) error {
+	offsets := intListArg(args, "--offsets", defaultOffsetList())
+	delay := probeDelay(args, 900*time.Millisecond)
+	cooldown := newProbeCooldown(args)
+	captureActivities := hasArg(args, "--capture-activities")
+	out := filepath.Join(dir, "probe_offset_list_"+time.Now().Format("20060102_150405")+".jsonl")
+	f, err := os.OpenFile(out, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	if err != nil {
+		return fmt.Errorf("创建 offset 列表探查日志失败: %w", err)
+	}
+	defer f.Close()
+
+	say("开始 offset 候选点探查，共 %d 个点 delay=%s，结果写入 %s", len(offsets), delay, out)
+	base := probeWindow{Label: "all-time", Begin: 0, End: 0}
+	healthResult := cfg.probeFeedResultWithCooldown(base, 0, probePageSize, "health-check", 1, time.Second, cooldown)
+	health := healthResult.Record
+	if err := writeProbeRecord(f, health); err != nil {
+		return fmt.Errorf("写入健康检查记录失败: %w", err)
+	}
+	if captureActivities {
+		if err := writeActivityRecords(f, base, 0, "health-check", healthResult.Activities); err != nil {
+			return fmt.Errorf("写入健康检查活动记录失败: %w", err)
+		}
+	}
+	if health.Status == "error" {
+		say("健康检查失败 offset=0 error=%s；停止探查，建议稍后冷却后重试", health.Error)
+		return nil
+	}
+	say("健康检查通过 offset=0 parsed=%d total=%d", health.ParsedCount, health.TotalNumber)
+	for _, offset := range offsets {
+		if offset == 0 {
+			continue
+		}
+		result := cfg.probeFeedResultWithCooldown(base, offset, probePageSize, "offset-list", 1, time.Second, cooldown)
+		rec := result.Record
+		if err := writeProbeRecord(f, rec); err != nil {
+			return fmt.Errorf("写入 offset 列表探查记录失败: %w", err)
+		}
+		if captureActivities {
+			if err := writeActivityRecords(f, base, offset, "offset-list", result.Activities); err != nil {
+				return fmt.Errorf("写入 offset 列表活动记录失败: %w", err)
+			}
+		}
+		say("offset=%d parsed=%d total=%d min=%s max=%s status=%s",
+			offset, rec.ParsedCount, rec.TotalNumber, rec.MinTimeText, rec.MaxTimeText, rec.Status)
+		if rec.Status == "error" {
+			lg("offset 候选点探查 offset=%d 失败: %s", offset, rec.Error)
+		}
+		time.Sleep(delay)
+	}
+	say("offset 候选点探查完成：%s", out)
+	return nil
+}
+
+func runProbeDepth(cfg *config, dir string, args []string) error {
+	delay := probeDelay(args, 900*time.Millisecond)
+	cooldown := newProbeCooldown(args)
+	captureActivities := hasArg(args, "--capture-activities")
+	out := filepath.Join(dir, "probe_depth_"+time.Now().Format("20060102_150405")+".jsonl")
+	f, err := os.OpenFile(out, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	if err != nil {
+		return fmt.Errorf("创建探查日志失败: %w", err)
+	}
+	defer f.Close()
+
+	say("开始深度探查实验，结果写入 %s", out)
+	for _, window := range defaultProbeWindows() {
+		result := cfg.probeFeedResultWithCooldown(window, 0, probePageSize, "month-window", 3, time.Second, cooldown)
+		rec := result.Record
+		if err := writeProbeRecord(f, rec); err != nil {
+			return fmt.Errorf("写入探查记录失败: %w", err)
+		}
+		if captureActivities {
+			if err := writeActivityRecords(f, window, 0, "month-window", result.Activities); err != nil {
+				return fmt.Errorf("写入窗口活动记录失败: %w", err)
+			}
+		}
+		say("窗口 %s offset=0 parsed=%d total=%d status=%s", window.Label, rec.ParsedCount, rec.TotalNumber, rec.Status)
+		time.Sleep(delay)
+	}
+
+	base := probeWindow{Label: "all-time", Begin: 0, End: 0}
+	for _, offset := range exponentialOffsets(20000) {
+		result := cfg.probeFeedResultWithCooldown(base, offset, probePageSize, "exponential-offset", 3, time.Second, cooldown)
+		rec := result.Record
+		if err := writeProbeRecord(f, rec); err != nil {
+			return fmt.Errorf("写入探查记录失败: %w", err)
+		}
+		if captureActivities {
+			if err := writeActivityRecords(f, base, offset, "exponential-offset", result.Activities); err != nil {
+				return fmt.Errorf("写入全量 offset 活动记录失败: %w", err)
+			}
+		}
+		say("全量 offset=%d parsed=%d total=%d status=%s", offset, rec.ParsedCount, rec.TotalNumber, rec.Status)
+		if rec.Status == "error" {
+			lg("深度探查 offset=%d 失败: %s", offset, rec.Error)
+		}
+		time.Sleep(delay)
+	}
+	say("深度探查实验完成：%s", out)
+	return nil
+}
+
+// ---------- 动态流原始响应本地缓存（cache-first harvester） ----------
+//
+// 同一个 offset 的原始响应只由 offset 唯一决定（begin_time/end_time 已证明被服务端忽略，
+// count 固定 100），且历史动态流内容不再变化，因此可以安全地长期缓存到本地。
+// 落盘后所有分析/重建走本地，零网络；harvest 本身可断点续传、被风控就自动冷却。
+
+const feedCacheDirName = "feed_cache"
+const harvestPageSize = 100
+
+func feedCacheDir(dir string) string {
+	return filepath.Join(dir, feedCacheDirName)
+}
+
+// cachePath offset 零填充到 7 位，保证字典序 = offset 升序。
+func cachePath(dir string, offset int) string {
+	return filepath.Join(feedCacheDir(dir), fmt.Sprintf("off_%07d.body", offset))
+}
+
+func isCached(dir string, offset int) bool {
+	info, err := os.Stat(cachePath(dir, offset))
+	return err == nil && !info.IsDir()
+}
+
+func writeCache(dir string, offset int, body []byte) error {
+	if err := os.MkdirAll(feedCacheDir(dir), 0700); err != nil {
+		return err
+	}
+	return os.WriteFile(cachePath(dir, offset), body, 0600)
+}
+
+func readCache(dir string, offset int) ([]byte, error) {
+	return os.ReadFile(cachePath(dir, offset))
+}
+
+var cacheFileRe = regexp.MustCompile(`^off_(\d{7})\.body$`)
+
+// cachedOffsets 返回已缓存的全部 offset，升序。
+func cachedOffsets(dir string) ([]int, error) {
+	entries, err := os.ReadDir(feedCacheDir(dir))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var offs []int
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		m := cacheFileRe.FindStringSubmatch(e.Name())
+		if m == nil {
+			continue
+		}
+		if v, err := strconv.Atoi(m[1]); err == nil {
+			offs = append(offs, v)
+		}
+	}
+	sort.Ints(offs)
+	return offs, nil
+}
+
+// harvestPage 优先读缓存；缓存未命中才发一次网络请求（自带 501/429 冷却），成功后落盘。
+// 返回 (record, fromCache, fetched)：fromCache=命中缓存未发请求；fetched=成功取到并已落盘。
+func (c *config) harvestPage(dir string, offset int, cooldown *probeCooldown) (probeRecord, bool, bool) {
+	base := probeWindow{Label: "all-time", Begin: 0, End: 0}
+	if body, err := readCache(dir, offset); err == nil {
+		rec := analyzeFeedBody(c, base, offset, "harvest-cache", body)
+		return rec, true, false
+	}
+	result := c.probeRawWithCooldown(base, offset, harvestPageSize, "harvest", cooldown)
+	if result.Record.Status != "ok" {
+		return result.Record, false, false
+	}
+	if err := writeCache(dir, offset, result.RawBody); err != nil {
+		lg("harvest 写缓存失败 offset=%d err=%v", offset, err)
+		return result.Record, false, false
+	}
+	return result.Record, false, true
+}
+
+func harvestOffsets(args []string) []int {
+	start := intArg(args, "--offset-start", 0)
+	end := intArg(args, "--offset-end", 20000)
+	step := intArg(args, "--offset-step", harvestPageSize)
+	if start < 0 {
+		start = 0
+	}
+	if step < 1 {
+		step = harvestPageSize
+	}
+	if end < start {
+		end = start
+	}
+	var offs []int
+	for o := start; o <= end; o += step {
+		offs = append(offs, o)
+	}
+	return offs
+}
+
+// runHarvest 缓存优先地抓取一段 offset 网格：已缓存的跳过、未缓存的限速抓取并落盘。
+// 可随时中断、重跑续传；被 501/429 风控时自动冷却。
+func runHarvest(cfg *config, dir string, args []string) error {
+	offsets := harvestOffsets(args)
+	delay := probeDelay(args, 3000*time.Millisecond)
+	cooldown := newProbeCooldown(args)
+	manifestPath := filepath.Join(feedCacheDir(dir), "manifest.jsonl")
+	if err := os.MkdirAll(feedCacheDir(dir), 0700); err != nil {
+		return fmt.Errorf("创建缓存目录失败: %w", err)
+	}
+	mf, err := os.OpenFile(manifestPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+	if err != nil {
+		return fmt.Errorf("打开 manifest 失败: %w", err)
+	}
+	defer mf.Close()
+
+	say("开始 harvest：offset %d..%d step %d，共 %d 个点 delay=%s",
+		offsets[0], offsets[len(offsets)-1], offsets[1]-offsets[0], len(offsets), delay)
+	say("缓存目录：%s（已缓存的 offset 会直接跳过，可随时中断续传）", feedCacheDir(dir))
+
+	var cached, fetched, empty, failed int
+	for _, offset := range offsets {
+		if isCached(dir, offset) {
+			cached++
+			continue
+		}
+		rec, fromCache, ok := cfg.harvestPage(dir, offset, cooldown)
+		if fromCache {
+			cached++
+			continue
+		}
+		if !ok {
+			failed++
+			say("offset=%d 抓取失败 status=%s error=%s", offset, rec.Status, rec.Error)
+			if rec.Status == "error" && !isProbeCooldownError(rec) {
+				// 非风控错误（如健康检查级别失败）也继续，但记日志
+				lg("harvest offset=%d 非冷却类错误: %s", offset, rec.Error)
+			}
+			time.Sleep(delay)
+			continue
+		}
+		fetched++
+		if rec.ParsedCount == 0 {
+			empty++
+		}
+		if err := writeProbeRecord(mf, rec); err != nil {
+			lg("harvest 写 manifest 失败 offset=%d err=%v", offset, err)
+		}
+		say("offset=%d ✅ 已缓存 parsed=%d total=%d min=%s", offset, rec.ParsedCount, rec.TotalNumber, rec.MinTimeText)
+		time.Sleep(delay)
+	}
+	say("harvest 完成：命中缓存 %d、新抓 %d（其中空页 %d）、失败 %d", cached, fetched, empty, failed)
+	say("下一步：./QzoneExport --analyze-cache  （纯离线，出边界报告）")
+	return nil
+}
+
+// boundaryReport 缓存边界分析结果。
+type boundaryReport struct {
+	CachedCount       int    `json:"cached_count"`
+	EmptyCount        int    `json:"empty_count"`
+	NonEmptyCount     int    `json:"nonempty_count"`
+	DeepestCached     int    `json:"deepest_cached_offset"`
+	DeepestWithData   int    `json:"deepest_offset_with_data"`
+	TailEmptyRun      int    `json:"tail_consecutive_empty"`
+	GapOffsets        []int  `json:"gap_offsets"`
+	GlobalMinTimeText string `json:"global_min_time_text"`
+	GlobalMinUnix     int64  `json:"global_min_unix"`
+	GlobalMaxTimeText string `json:"global_max_time_text"`
+	DedupActivities   int    `json:"dedup_activities"`
+}
+
+// analyzeCache 纯离线遍历缓存，解析+去重所有活动，计算边界报告。
+func analyzeCache(cfg *config, dir string) (boundaryReport, []activity, error) {
+	offs, err := cachedOffsets(dir)
+	if err != nil {
+		return boundaryReport{}, nil, err
+	}
+	if len(offs) == 0 {
+		return boundaryReport{}, nil, fmt.Errorf("缓存为空；请先运行 --harvest")
+	}
+	base := probeWindow{Label: "all-time", Begin: 0, End: 0}
+	rep := boundaryReport{CachedCount: len(offs), GlobalMinUnix: 0}
+	seen := map[string]bool{}
+	var all []activity
+	var minUnix int64
+	var maxUnix int64
+	// 缺口判定按 harvest 的固定 100 网格；从稀疏缓存反推步长会漏报缺口
+	step := harvestPageSize
+	for _, offset := range offs {
+		body, err := readCache(dir, offset)
+		if err != nil {
+			continue
+		}
+		rec := analyzeFeedBody(cfg, base, offset, "analyze-cache", body)
+		if offset > rep.DeepestCached {
+			rep.DeepestCached = offset
+		}
+		if rec.ParsedCount == 0 {
+			rep.EmptyCount++
+		} else {
+			rep.NonEmptyCount++
+			if offset > rep.DeepestWithData {
+				rep.DeepestWithData = offset
+			}
+		}
+		for _, a := range cfg.parseActivities(processOldHTML(string(body))) {
+			key := activityDedupeKey(a)
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			all = append(all, a)
+			u := tsToUnix(a.Timestamp)
+			if u > 0 {
+				if minUnix == 0 || u < minUnix {
+					minUnix = u
+					rep.GlobalMinTimeText = a.TimeText
+				}
+				if u > maxUnix {
+					maxUnix = u
+					rep.GlobalMaxTimeText = a.TimeText
+				}
+			}
+		}
+	}
+	rep.GlobalMinUnix = minUnix
+	rep.DedupActivities = len(all)
+	// 缺口：理论网格 0..DeepestCached step，缺失的 offset
+	cachedSet := map[int]bool{}
+	for _, o := range offs {
+		cachedSet[o] = true
+	}
+	for o := offs[0]; o <= rep.DeepestCached; o += step {
+		if !cachedSet[o] {
+			rep.GapOffsets = append(rep.GapOffsets, o)
+		}
+	}
+	// 尾部连续空页：从最深 offset 往回数连续 ParsedCount==0 的页
+	for i := len(offs) - 1; i >= 0; i-- {
+		body, err := readCache(dir, offs[i])
+		if err != nil {
+			break
+		}
+		if analyzeFeedBody(cfg, base, offs[i], "tail", body).ParsedCount == 0 {
+			rep.TailEmptyRun++
+		} else {
+			break
+		}
+	}
+	return rep, all, nil
+}
+
+func runAnalyzeCache(cfg *config, dir string, args []string) error {
+	rep, all, err := analyzeCache(cfg, dir)
+	if err != nil {
+		return err
+	}
+	say("===== 缓存边界报告 =====")
+	say("已缓存页=%d（空页=%d，有数据=%d） 缺口 offset 数=%d", rep.CachedCount, rep.EmptyCount, rep.NonEmptyCount, len(rep.GapOffsets))
+	say("最深已缓存 offset=%d，最深有数据 offset=%d", rep.DeepestCached, rep.DeepestWithData)
+	say("尾部连续空页=%d", rep.TailEmptyRun)
+	say("去重后活动总数=%d", rep.DedupActivities)
+	say("全局最早活动=%s（unix=%d）", rep.GlobalMinTimeText, rep.GlobalMinUnix)
+	say("全局最晚活动=%s", rep.GlobalMaxTimeText)
+	complete := len(rep.GapOffsets) == 0 && rep.TailEmptyRun >= 20
+	if complete {
+		say("✅ 网格无缺口且尾部连续空页≥20：可判定 %s 为动态流真实边界", rep.GlobalMinTimeText)
+	} else {
+		if len(rep.GapOffsets) > 0 {
+			preview := rep.GapOffsets
+			if len(preview) > 10 {
+				preview = preview[:10]
+			}
+			say("⚠️ 仍有 %d 个缺口未补全（如 %v…），重跑 --harvest 自动续传", len(rep.GapOffsets), preview)
+		}
+		if rep.TailEmptyRun < 20 {
+			say("⚠️ 尾部连续空页仅 %d（<20），用 --harvest --offset-end %d 继续往深处扫以确认边界", rep.TailEmptyRun, rep.DeepestCached+2000)
+		}
+	}
+	// 导出去重活动为 JSONL，复用 --preview-year / --analyze-probe
+	actPath := filepath.Join(dir, "cache_activities_"+time.Now().Format("20060102_150405")+".jsonl")
+	if af, err := os.OpenFile(actPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600); err == nil {
+		base := probeWindow{Label: "all-time", Begin: 0, End: 0}
+		_ = writeActivityRecords(af, base, 0, "analyze-cache", all)
+		af.Close()
+		say("已导出去重活动明细：%s", actPath)
+	}
+	// 全量重建 HTML（不限年份）
+	recons := reconstructMoments(all)
+	deleted := reconAsDeletedMsgs(recons, nil)
+	sort.Slice(deleted, func(i, j int) bool { return deleted[i].CreatedTime > deleted[j].CreatedTime })
+	// 默认只引用远程图片 URL（零网络）；加 --download-images 则真正下载并 base64 内嵌，防图床过期
+	var datauri map[string]string
+	if hasArg(args, "--download-images") {
+		say("开始下载重建说说的图片并内嵌（防止图床链接过期）…")
+		datauri = cfg.downloadCards(deleted)
+	} else {
+		datauri = remoteImageMap(deleted)
+	}
+	doc := buildHTML("缓存全量重建预览", nil, deleted, datauri)
+	outHTML := filepath.Join(dir, "reconstructed_all_from_cache.html")
+	if err := os.WriteFile(outHTML, []byte(doc), 0600); err != nil {
+		return err
+	}
+	say("已生成全量重建预览：%s（%d 条疑似已删除）", outHTML, len(deleted))
+	if !hasArg(args, "--download-images") {
+		say("提示：加 --download-images 可把图片下载并内嵌进 HTML（防止 QQ 图床链接日后失效）")
+	}
+	return nil
 }
 
 // ---------- HTML ----------
@@ -1361,21 +2728,7 @@ func runDemo() {
 	openInSystem(out)
 }
 
-func main() {
-	if len(os.Args) > 1 && os.Args[1] == "--demo" {
-		runDemo()
-		return
-	}
-	fmt.Println("================================================")
-	fmt.Printf("        QQ空间说说导出工具  v%s\n", version)
-	fmt.Println("================================================")
-	dir := exeDir()
-	logPath := initLog(dir)
-	if logPath != "" {
-		fmt.Printf("📝 详细日志: %s\n", logPath)
-	}
-	defer closeLog()
-
+func loadOrLogin(dir string) *config {
 	cfg := loadConfig(dir)
 	if cfg != nil {
 		lg("检测到本地 cookies.json，校验登录态…")
@@ -1390,7 +2743,191 @@ func main() {
 	if cfg == nil {
 		cfg = login(dir)
 	}
+	return cfg
+}
 
+func loadOrLoginForProbe(dir string, args []string) *config {
+	cfg := loadConfig(dir)
+	if cfg != nil {
+		lg("检测到本地 cookies.json，校验登录态…")
+		fmt.Println("检测到本地 cookies.json，正在校验登录态…")
+		if validateConfig(cfg) {
+			say("✅ 检测到有效登录（QQ %s），跳过扫码", cfg.QQ)
+			return cfg
+		}
+		fmt.Println("ℹ️ 旧登录已过期")
+	}
+	if hasArg(args, "--no-login") {
+		say("❌ 登录态无效，且指定了 --no-login；未执行扫码登录")
+		waitExit()
+		os.Exit(1)
+	}
+	return login(dir)
+}
+
+func main() {
+	if hasArg(os.Args[1:], "--demo") {
+		runDemo()
+		return
+	}
+	if hasArg(os.Args[1:], "--analyze-probe") {
+		if err := runAnalyzeProbe(os.Args[1:], exeDir()); err != nil {
+			fmt.Println("❌ 探查日志分析失败:", err)
+			os.Exit(1)
+		}
+		return
+	}
+	if hasArg(os.Args[1:], "--preview-year") {
+		if err := runPreviewYear(os.Args[1:], exeDir()); err != nil {
+			fmt.Println("❌ 生成年份预览失败:", err)
+			os.Exit(1)
+		}
+		return
+	}
+	fmt.Println("================================================")
+	fmt.Printf("        QQ空间说说导出工具  v%s\n", version)
+	fmt.Println("================================================")
+	dir := exeDir()
+	logPath := initLog(dir)
+	if logPath != "" {
+		fmt.Printf("📝 详细日志: %s\n", logPath)
+	}
+	defer closeLog()
+
+	if hasArg(os.Args[1:], "--analyze-cache") {
+		var cfg *config
+		if hasArg(os.Args[1:], "--download-images") {
+			// 下载图片需要有效登录态（g_tk）
+			cfg = loadOrLoginForProbe(dir, os.Args[1:])
+		} else {
+			cfg = loadConfig(dir)
+			if cfg == nil {
+				cfg = &config{QQ: ""}
+			}
+		}
+		if err := runAnalyzeCache(cfg, dir, os.Args[1:]); err != nil {
+			say("❌ 缓存分析失败: %v", err)
+			os.Exit(1)
+		}
+		return
+	}
+	if hasArg(os.Args[1:], "--harvest") {
+		cfg := loadOrLoginForProbe(dir, os.Args[1:])
+		if err := runHarvest(cfg, dir, os.Args[1:]); err != nil {
+			say("❌ harvest 失败: %v", err)
+			waitExit()
+			os.Exit(1)
+		}
+		fmt.Println("\n⚠️ 提示：缓存目录含你的空间内容摘要与图片 URL，请自行保管。")
+		if runtime.GOOS == "windows" {
+			waitExit()
+		}
+		return
+	}
+	if hasArg(os.Args[1:], "--diagnose") {
+		cfg := loadOrLoginForProbe(dir, os.Args[1:])
+		if err := runDiagnose(cfg, dir); err != nil {
+			say("❌ 诊断失败: %v", err)
+		}
+		if runtime.GOOS == "windows" {
+			waitExit()
+		}
+		return
+	}
+	if hasArg(os.Args[1:], "--harvest-photos") {
+		cfg := loadOrLoginForProbe(dir, os.Args[1:])
+		if err := runHarvestPhotos(cfg, dir); err != nil {
+			say("❌ 相册找回失败: %v", err)
+		}
+		fmt.Println("\n⚠️ 提示：相册回忆网页含你的照片，请自行保管。")
+		if runtime.GOOS == "windows" {
+			waitExit()
+		}
+		return
+	}
+	if hasArg(os.Args[1:], "--harvest-board") {
+		cfg := loadOrLoginForProbe(dir, os.Args[1:])
+		if err := runHarvestBoard(cfg, dir); err != nil {
+			say("❌ 留言板找回失败: %v", err)
+		}
+		if runtime.GOOS == "windows" {
+			waitExit()
+		}
+		return
+	}
+	if hasArg(os.Args[1:], "--harvest-blogs") {
+		cfg := loadOrLoginForProbe(dir, os.Args[1:])
+		if err := runHarvestBlogs(cfg, dir); err != nil {
+			say("❌ 日志找回失败: %v", err)
+		}
+		if runtime.GOOS == "windows" {
+			waitExit()
+		}
+		return
+	}
+	if hasArg(os.Args[1:], "--resolve-tid") {
+		cfg := loadOrLoginForProbe(dir, os.Args[1:])
+		tid := strArg(os.Args[1:], "--resolve-tid", "")
+		if err := runResolveTid(cfg, dir, tid); err != nil {
+			say("❌ 说说详情还原失败: %v", err)
+		}
+		if runtime.GOOS == "windows" {
+			waitExit()
+		}
+		return
+	}
+	if hasArg(os.Args[1:], "--recover-all") {
+		cfg := loadOrLoginForProbe(dir, os.Args[1:])
+		if err := runRecoverAll(cfg, dir); err != nil {
+			say("❌ 回忆找回失败: %v", err)
+		}
+		fmt.Println("\n⚠️ 提示：找回的网页含你的照片与内容，请自行保管。")
+		if runtime.GOOS == "windows" {
+			waitExit()
+		}
+		return
+	}
+	if hasArg(os.Args[1:], "--probe-offset-list") {
+		cfg := loadOrLoginForProbe(dir, os.Args[1:])
+		if err := runProbeOffsetList(cfg, dir, os.Args[1:]); err != nil {
+			say("❌ offset 候选点探查失败: %v", err)
+			waitExit()
+			os.Exit(1)
+		}
+		fmt.Println("\n⚠️ 提示：探查日志可能含你的空间内容摘要，请自行保管。")
+		if runtime.GOOS == "windows" {
+			waitExit()
+		}
+		return
+	}
+	if hasArg(os.Args[1:], "--probe-offset-range") {
+		cfg := loadOrLoginForProbe(dir, os.Args[1:])
+		if err := runProbeOffsetRange(cfg, dir, os.Args[1:]); err != nil {
+			say("❌ offset 密集探查失败: %v", err)
+			waitExit()
+			os.Exit(1)
+		}
+		fmt.Println("\n⚠️ 提示：探查日志可能含你的空间内容摘要，请自行保管。")
+		if runtime.GOOS == "windows" {
+			waitExit()
+		}
+		return
+	}
+	if hasArg(os.Args[1:], "--probe-depth") {
+		cfg := loadOrLoginForProbe(dir, os.Args[1:])
+		if err := runProbeDepth(cfg, dir, os.Args[1:]); err != nil {
+			say("❌ 深度探查失败: %v", err)
+			waitExit()
+			os.Exit(1)
+		}
+		fmt.Println("\n⚠️ 提示：探查日志可能含你的空间内容摘要，请自行保管。")
+		if runtime.GOOS == "windows" {
+			waitExit()
+		}
+		return
+	}
+
+	cfg := loadOrLogin(dir)
 	say("\n开始抓取 QQ %s 的全部说说…", cfg.QQ)
 	firstPage, err := cfg.fetchPage(0, 20)
 	if err != nil || firstPage.Code != 0 {
