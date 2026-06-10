@@ -90,7 +90,10 @@ QQ 空间官方没有“导出说说”的功能。本工具通过你**自己登
 ./QzoneExport --harvest-photos
 
 # 动态流深度抓取（缓存优先、慢速、断点续传），用于重建更多已删除说说
-./QzoneExport --harvest --offset-end 20000 --probe-delay-ms 5000
+# 新增 --auto-stop-empty 参数：连续 N 个空 offset 自动停止，无需手动设上限
+./QzoneExport --harvest --auto-stop-empty 50 --probe-delay-ms 3000
+# 或手动指定范围（默认 offset-end=100000，step=100）
+./QzoneExport --harvest --offset-end 50000 --offset-step 100 --probe-delay-ms 5000
 # 纯离线分析缓存：出「重建边界报告」并生成全量重建网页（加 --download-images 可下载内嵌配图）
 ./QzoneExport --analyze-cache --download-images
 ```
@@ -132,6 +135,8 @@ python3 qzone_export.py
   抓一次存本地，之后调试/分析/重建零网络，不再暴力重复请求。
 - 🔭 **真正判定重建边界**：当「offset 网格无缺口 + 尾部连续空页 ≥ 20」时，给出动态流可重建的
   真实最早时间。实测把已知最远从 2017-09-03 推进并确证到 **2017-07-25**。
+- 🚀 **自动探索 offset 上限**：新增 `--auto-stop-empty=N` 参数，连续 N 个空 offset 自动停止，
+  无需手动猜测上限。默认 `--offset-end` 提升至 100000，配合自动停止避免无效请求。
 - 🧰 **跨数据源回忆找回**（`recover.go`，复用零依赖架构）：
   - `--diagnose`：拉 `main_page_cgi` 计数（说说 / 相册 / 日志总数），判断 2017 是删除边界还是漏抓。
   - `--harvest-photos`：相册 → 照片（`fcg_list_album_v3` + `cgi_list_photo`，带 `uploadtime` / 描述 /

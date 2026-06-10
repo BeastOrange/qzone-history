@@ -2158,7 +2158,7 @@ func (c *config) harvestPage(dir string, offset int, cooldown *probeCooldown) (p
 
 func harvestOffsets(args []string) []int {
 	start := intArg(args, "--offset-start", 0)
-	end := intArg(args, "--offset-end", 20000)
+	end := intArg(args, "--offset-end", 100000) // 提高默认上限，配合 auto-stop
 	step := intArg(args, "--offset-step", harvestPageSize)
 	if start < 0 {
 		start = 0
@@ -2182,6 +2182,7 @@ func runHarvest(cfg *config, dir string, args []string) error {
 	offsets := harvestOffsets(args)
 	delay := probeDelay(args, 3000*time.Millisecond)
 	cooldown := newProbeCooldown(args)
+	autoStopEmpty := intArg(args, "--auto-stop-empty", 0) // 0 = 不自动停止
 	manifestPath := filepath.Join(feedCacheDir(dir), "manifest.jsonl")
 	if err := os.MkdirAll(feedCacheDir(dir), 0700); err != nil {
 		return fmt.Errorf("创建缓存目录失败: %w", err)
@@ -2194,9 +2195,12 @@ func runHarvest(cfg *config, dir string, args []string) error {
 
 	say("开始 harvest：offset %d..%d step %d，共 %d 个点 delay=%s",
 		offsets[0], offsets[len(offsets)-1], offsets[1]-offsets[0], len(offsets), delay)
+	if autoStopEmpty > 0 {
+		say("自动停止：连续 %d 个空 offset 将终止探索", autoStopEmpty)
+	}
 	say("缓存目录：%s（已缓存的 offset 会直接跳过，可随时中断续传）", feedCacheDir(dir))
 
-	var cached, fetched, empty, failed int
+	var cached, fetched, empty, failed, consecutiveEmpty int
 	for _, offset := range offsets {
 		if isCached(dir, offset) {
 			cached++
@@ -2220,6 +2224,13 @@ func runHarvest(cfg *config, dir string, args []string) error {
 		fetched++
 		if rec.ParsedCount == 0 {
 			empty++
+			consecutiveEmpty++
+			if autoStopEmpty > 0 && consecutiveEmpty >= autoStopEmpty {
+				say("连续 %d 个 offset 为空，自动停止探索（当前 offset=%d）", consecutiveEmpty, offset)
+				break
+			}
+		} else {
+			consecutiveEmpty = 0 // 有数据则重置计数
 		}
 		if err := writeProbeRecord(mf, rec); err != nil {
 			lg("harvest 写 manifest 失败 offset=%d err=%v", offset, err)
