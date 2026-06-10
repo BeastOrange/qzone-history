@@ -4,6 +4,7 @@
 *.env
 app.db
 qrcode.png
+.worktrees/
 
 # oneclick 产物（作为 release 资产分发，不入库）
 oneclick/QzoneExport
