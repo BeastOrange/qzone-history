@@ -222,6 +222,27 @@ func exeDir() string {
 	return filepath.Dir(exe)
 }
 
+const outputDirName = "QzoneExport_output"
+
+// outputDir 返回 exe 同层级的统一输出目录。所有运行产物（cookies、日志、HTML、缓存、图片）
+// 都放在这里，避免把 exe 同目录弄乱，也避免把大量图片内嵌进一个超大 HTML。
+func outputDir() string {
+	base := exeDir()
+	out := filepath.Join(base, outputDirName)
+	if err := os.MkdirAll(out, 0700); err != nil {
+		return base
+	}
+	// 兼容旧版本：如果 exe 同级已有 cookies.json，首次运行自动复用到输出目录。
+	oldCookie := filepath.Join(base, "cookies.json")
+	newCookie := filepath.Join(out, "cookies.json")
+	if _, err := os.Stat(newCookie); os.IsNotExist(err) {
+		if b, err := os.ReadFile(oldCookie); err == nil {
+			_ = os.WriteFile(newCookie, b, 0600)
+		}
+	}
+	return out
+}
+
 // ---------- 数据结构 ----------
 
 // flexStr 兼容 g_tk 在 JSON 里既可能是字符串也可能是数字
@@ -2719,7 +2740,7 @@ func runDemo() {
 		}
 	}
 	doc := buildHTML("演示账号", existing, deleted, datauri)
-	out := filepath.Join(exeDir(), "QQ空间_demo.html")
+	out := filepath.Join(outputDir(), "QQ空间_demo.html")
 	if err := os.WriteFile(out, []byte(doc), 0600); err != nil {
 		fmt.Println("写入失败:", err)
 		return
@@ -2771,14 +2792,14 @@ func main() {
 		return
 	}
 	if hasArg(os.Args[1:], "--analyze-probe") {
-		if err := runAnalyzeProbe(os.Args[1:], exeDir()); err != nil {
+		if err := runAnalyzeProbe(os.Args[1:], outputDir()); err != nil {
 			fmt.Println("❌ 探查日志分析失败:", err)
 			os.Exit(1)
 		}
 		return
 	}
 	if hasArg(os.Args[1:], "--preview-year") {
-		if err := runPreviewYear(os.Args[1:], exeDir()); err != nil {
+		if err := runPreviewYear(os.Args[1:], outputDir()); err != nil {
 			fmt.Println("❌ 生成年份预览失败:", err)
 			os.Exit(1)
 		}
@@ -2787,7 +2808,7 @@ func main() {
 	fmt.Println("================================================")
 	fmt.Printf("        QQ空间说说导出工具  v%s\n", version)
 	fmt.Println("================================================")
-	dir := exeDir()
+	dir := outputDir()
 	logPath := initLog(dir)
 	if logPath != "" {
 		fmt.Printf("📝 详细日志: %s\n", logPath)

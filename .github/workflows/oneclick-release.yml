@@ -1,0 +1,67 @@
+name: Release oneclick binaries
+
+on:
+  push:
+    tags:
+      - 'oneclick-v*'  # 只在推送 oneclick-vX.X 标签时触发
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Extract version
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/oneclick-v}" >> $GITHUB_OUTPUT
+
+      - name: Build binaries
+        run: |
+          cd oneclick
+          # Windows amd64
+          GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o ../dist/QzoneExport-windows-amd64.exe .
+          # macOS universal (amd64 + arm64)
+          GOOS=darwin GOARCH=amd64 go build -ldflags="-s -w" -o ../dist/qe-amd64 .
+          GOOS=darwin GOARCH=arm64 go build -ldflags="-s -w" -o ../dist/qe-arm64 .
+          lipo -create -output ../dist/QzoneExport-macOS ../dist/qe-amd64 ../dist/qe-arm64
+          rm ../dist/qe-amd64 ../dist/qe-arm64
+          # Linux amd64 (bonus)
+          GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o ../dist/QzoneExport-linux-amd64 .
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/QzoneExport-windows-amd64.exe
+            dist/QzoneExport-macOS
+            dist/QzoneExport-linux-amd64
+          body: |
+            ## QQ 空间说说导出工具 v${{ steps.version.outputs.VERSION }}
+
+            零依赖单文件工具，双击运行、扫码登录、自动导出为本地网页。
+
+            ### 下载
+            - **Windows 用户**: `QzoneExport-windows-amd64.exe`
+            - **macOS 用户**: `QzoneExport-macOS` (Intel + Apple Silicon 通用)
+            - **Linux 用户**: `QzoneExport-linux-amd64`
+
+            ### 使用
+            1. 下载对应系统的文件
+            2. 双击运行（macOS 首次需右键→打开以绕过安全检查）
+            3. 扫码登录后自动抓取并生成 `QQ空间_<QQ号>.html`
+            4. 工具会在同层级创建 `QzoneExport_output/` 文件夹存放所有产物
+
+            完整说明见 [oneclick/README.md](https://github.com/${{ github.repository }}/blob/main/oneclick/README.md)
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
