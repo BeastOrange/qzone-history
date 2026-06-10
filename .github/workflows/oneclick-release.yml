@@ -29,11 +29,10 @@ jobs:
           cd oneclick
           # Windows amd64
           GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o ../dist/QzoneExport-windows-amd64.exe .
-          # macOS universal (amd64 + arm64)
-          GOOS=darwin GOARCH=amd64 go build -ldflags="-s -w" -o ../dist/qe-amd64 .
-          GOOS=darwin GOARCH=arm64 go build -ldflags="-s -w" -o ../dist/qe-arm64 .
-          lipo -create -output ../dist/QzoneExport-macOS ../dist/qe-amd64 ../dist/qe-arm64
-          rm ../dist/qe-amd64 ../dist/qe-arm64
+          # macOS arm64 (Apple Silicon)
+          GOOS=darwin GOARCH=arm64 go build -ldflags="-s -w" -o ../dist/QzoneExport-macOS-arm64 .
+          # macOS amd64 (Intel)
+          GOOS=darwin GOARCH=amd64 go build -ldflags="-s -w" -o ../dist/QzoneExport-macOS-amd64 .
           # Linux amd64 (bonus)
           GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o ../dist/QzoneExport-linux-amd64 .
 
@@ -42,7 +41,8 @@ jobs:
         with:
           files: |
             dist/QzoneExport-windows-amd64.exe
-            dist/QzoneExport-macOS
+            dist/QzoneExport-macOS-arm64
+            dist/QzoneExport-macOS-amd64
             dist/QzoneExport-linux-amd64
           body: |
             ## QQ 空间说说导出工具 v${{ steps.version.outputs.VERSION }}
@@ -51,7 +51,9 @@ jobs:
 
             ### 下载
             - **Windows 用户**: `QzoneExport-windows-amd64.exe`
-            - **macOS 用户**: `QzoneExport-macOS` (Intel + Apple Silicon 通用)
+            - **macOS 用户**:
+              - Apple Silicon (M1/M2/M3): `QzoneExport-macOS-arm64`
+              - Intel 芯片: `QzoneExport-macOS-amd64`
             - **Linux 用户**: `QzoneExport-linux-amd64`
 
             ### 使用
